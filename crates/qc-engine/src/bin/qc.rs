@@ -44,6 +44,7 @@ fn main() -> ExitCode {
         }
     };
     let t_plan = t0.elapsed();
+    let mem_plan = qc_engine::ticket::peak_memory();
     let prog = Progress::default();
     let r = execute(&p, &opts, &prog, &|_| res);
     println!(
@@ -57,6 +58,7 @@ fn main() -> ExitCode {
         r.skipped.len(),
         r.failures.len()
     );
+    println!("内存：扫描后 {mem_plan}；结束 {}", qc_engine::ticket::peak_memory());
     for (path, e) in r.failures.iter().chain(&p.errors).take(10) {
         eprintln!("  失败 {}：{e}", path.display());
     }

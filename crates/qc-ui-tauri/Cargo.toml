@@ -1,0 +1,15 @@
+[package]
+name = "qc-ui-tauri"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+qc-engine = { path = "../qc-engine" }
+serde = { version = "1", features = ["derive"] }
+# 不用 tauri-cli，直接 cargo build；custom-protocol 让前端从 exe 内嵌资源加载而不是找开发服务器
+tauri = { version = "2.12", features = ["custom-protocol"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging"] }
+
+[build-dependencies]
+tauri-build = { version = "2.7", features = [] }

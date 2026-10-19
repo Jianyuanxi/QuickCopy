@@ -1,0 +1,153 @@
+param(
+  [string]$Src,
+  [string]$Dest,
+  [string]$Ui = 'win32',
+  [switch]$Cut,
+  # 按 Ctrl+V 前焦点放在哪：list 文件列表 / rename 重命名框 / address 地址栏 / search 搜索框
+  [string]$Focus = 'list',
+  # 粘贴到桌面：Win+D 显示桌面后按 Ctrl+V，结束再 Win+D 还原
+  [switch]$Desktop,
+  # 多标签页：窗口开到 $Dest 后 Ctrl+T 新开标签页，转到 $TabTo，应该粘贴进 $TabTo 而不是 $Dest
+  [string]$TabTo = '',
+  [int]$TimeoutS = 30
+)
+# 端到端：常驻进程 + 真实资源管理器窗口。把文件放进剪贴板，开一个资源管理器窗口到 $Dest，
+# 模拟按 Ctrl+V，等界面进程写完日志，打印这次的日志和目标里的文件数。
+$ErrorActionPreference = 'Stop'
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type @'
+using System; using System.Runtime.InteropServices; using System.Text;
+public static class K {
+  [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
+  [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+  [DllImport("user32.dll")] public static extern void keybd_event(byte vk, byte scan, uint flags, UIntPtr extra);
+  [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, IntPtr pid);
+  [DllImport("user32.dll")] public static extern bool GetGUIThreadInfo(uint tid, ref GUITHREADINFO g);
+  [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetClassNameW(IntPtr h, StringBuilder s, int n);
+  [StructLayout(LayoutKind.Sequential)] public struct RECT { public int L, T, R, B; }
+  [StructLayout(LayoutKind.Sequential)] public struct GUITHREADINFO {
+    public int cbSize; public int flags; public IntPtr active, focus, capture, menuOwner, moveSize, caret; public RECT rc; }
+  public static string Cls(IntPtr h) { var s = new StringBuilder(64); GetClassNameW(h, s, 64); return s.ToString(); }
+  public static string FocusClass(IntPtr fg) {
+    var g = new GUITHREADINFO(); g.cbSize = Marshal.SizeOf(g);
+    GetGUIThreadInfo(GetWindowThreadProcessId(fg, IntPtr.Zero), ref g); return Cls(g.focus); }
+  public static void Fg(IntPtr h) { keybd_event(0x12, 0, 0, UIntPtr.Zero); SetForegroundWindow(h); keybd_event(0x12, 0, 2, UIntPtr.Zero); }
+  [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
+  [DllImport("user32.dll")] public static extern void mouse_event(uint f, int x, int y, uint d, UIntPtr e);
+  [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
+  [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
+  [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern IntPtr FindWindowExW(IntPtr p, IntPtr after, string c, string t);
+  public static IntPtr Find(IntPtr parent, string cls) {
+    IntPtr c = IntPtr.Zero;
+    while ((c = FindWindowExW(parent, c, null, null)) != IntPtr.Zero) {
+      if (Cls(c) == cls && IsWindowVisible(c)) return c;
+      var r = Find(c, cls); if (r != IntPtr.Zero) return r;
+    }
+    return IntPtr.Zero; }
+  // 点一下文件列表底部的空白处，让焦点落到文件列表上（新版资源管理器刚打开时焦点在 XAML 地址栏那边）
+  public static string ClickList(IntPtr top) {
+    var dv = Find(top, "SHELLDLL_DefView"); if (dv == IntPtr.Zero) return "没找到 SHELLDLL_DefView";
+    RECT r; GetWindowRect(dv, out r);
+    SetCursorPos((r.L + r.R) / 2, r.B - 15); mouse_event(2, 0, 0, 0, UIntPtr.Zero); mouse_event(4, 0, 0, 0, UIntPtr.Zero);
+    return "ok"; }
+  public static void Keys(params byte[] vks) {
+    foreach (var v in vks) keybd_event(v, 0, 0, UIntPtr.Zero);
+    for (int i = vks.Length - 1; i >= 0; i--) keybd_event(vks[i], 0, 2, UIntPtr.Zero); }
+  public static void CtrlV() {
+    keybd_event(0x11, 0, 0, UIntPtr.Zero); keybd_event(0x56, 0, 0, UIntPtr.Zero);
+    keybd_event(0x56, 0, 2, UIntPtr.Zero); keybd_event(0x11, 0, 2, UIntPtr.Zero); }
+}
+'@
+
+$root = Resolve-Path "$PSScriptRoot\.."
+$log = Join-Path $env:LOCALAPPDATA 'QuickCopy\quickcopy.log'
+# 常驻进程按 -Ui 重启一次
+& "$root\target\release\quickcopy.exe" --quit
+Start-Sleep -Milliseconds 300
+Start-Process "$root\target\release\quickcopy.exe" -ArgumentList '--ui', $Ui
+Start-Sleep -Milliseconds 500
+
+$files = New-Object System.Collections.Specialized.StringCollection
+# pwsh -File 传不了数组，多个源用 | 隔开
+$Src -split '\|' | ForEach-Object { [void]$files.Add((Resolve-Path $_).Path) }
+$data = New-Object System.Windows.Forms.DataObject
+$data.SetFileDropList($files)
+$effect = if ($Cut) { 2 } else { 5 }
+$data.SetData('Preferred DropEffect', (New-Object IO.MemoryStream (, [BitConverter]::GetBytes([int]$effect))))
+[System.Windows.Forms.Clipboard]::SetDataObject($data, $true)
+
+if ($Desktop) {
+  $Dest = [Environment]::GetFolderPath('Desktop')
+  [K]::Keys(0x5B, 0x44); Start-Sleep -Milliseconds 800
+  # 点右下角空白处（图标一般在左边），让焦点落到桌面图标列表上
+  $sc = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
+  [K]::SetCursorPos($sc.Right - 40, $sc.Bottom - 40) | Out-Null
+  [K]::mouse_event(2, 0, 0, 0, [UIntPtr]::Zero); [K]::mouse_event(4, 0, 0, 0, [UIntPtr]::Zero)
+  Start-Sleep -Milliseconds 400
+  $fgNow = [K]::GetForegroundWindow()
+  "前台 $([K]::Cls($fgNow)) 焦点控件 $([K]::FocusClass($fgNow))"
+  $mark = (Get-Item $log).Length
+  [K]::CtrlV(); Start-Sleep -Seconds 3
+  [K]::Keys(0x5B, 0x44)
+  $fs = [IO.File]::Open($log, 'Open', 'Read', 'ReadWrite'); $fs.Seek($mark, 'Begin') | Out-Null
+  (New-Object IO.StreamReader($fs, [Text.Encoding]::UTF8)).ReadToEnd(); $fs.Close()
+  return
+}
+$Dest = (Resolve-Path $Dest).Path
+$shell = New-Object -ComObject Shell.Application
+$before = @($shell.Windows() | ForEach-Object { $_.HWND })
+Start-Process explorer.exe "`"$Dest`""
+$win = $null
+for ($i = 0; $i -lt 50 -and -not $win; $i++) {
+  Start-Sleep -Milliseconds 100
+  $win = $shell.Windows() | Where-Object { $_.Document -and $_.Document.Folder.Self.Path -eq $Dest } | Select-Object -Last 1
+}
+if (-not $win) { throw "没找到资源管理器窗口 $Dest" }
+$h = [IntPtr]$win.HWND
+Start-Sleep -Milliseconds 800
+[K]::Fg($h)
+Start-Sleep -Milliseconds 300
+if ($TabTo) {
+  [K]::Keys(0x11, 0x54); Start-Sleep -Milliseconds 800        # Ctrl+T
+  # 地址栏打字会被中文输入法截走，直接让新标签页（主页，LocationURL 为空）跳过去
+  $tab = $shell.Windows() | Where-Object { $_.HWND -eq $win.HWND -and -not $_.LocationURL } | Select-Object -First 1
+  if (-not $tab) { throw '没找到新开的标签页' }
+  $tab.Navigate2((Resolve-Path $TabTo).Path)
+  $Dest = (Resolve-Path $TabTo).Path
+  $url = ([Uri]$Dest).AbsoluteUri
+  for ($i = 0; $i -lt 50; $i++) {   # 等新标签页真正转到目标
+    if ($shell.Windows() | Where-Object { $_.HWND -eq $win.HWND -and $_.LocationURL -eq $url }) { break }
+    Start-Sleep -Milliseconds 100
+  }
+  Start-Sleep -Milliseconds 300
+  "同窗口的标签页：" + (($shell.Windows() | Where-Object { $_.HWND -eq $win.HWND } | ForEach-Object { $_.LocationURL }) -join ' | ')
+}
+"点击文件列表 $([K]::ClickList($h))"
+Start-Sleep -Milliseconds 300
+switch ($Focus) {
+  'rename' { [K]::Keys(0x24); Start-Sleep -Milliseconds 200; [K]::Keys(0x71) }   # Home 选第一项，F2
+  'address' { [K]::Keys(0x12, 0x44) }                                              # Alt+D
+  'search' { [K]::Keys(0x11, 0x45) }                                               # Ctrl+E
+}
+Start-Sleep -Milliseconds 500
+$fgNow = [K]::GetForegroundWindow()
+"前台 $([K]::Cls($fgNow)) 焦点控件 $([K]::FocusClass($fgNow))"
+
+$mark = (Get-Item $log).Length
+[K]::CtrlV()
+$sw = [Diagnostics.Stopwatch]::StartNew()
+$done = $false
+while (-not $done -and $sw.Elapsed.TotalSeconds -lt $TimeoutS) {
+  Start-Sleep -Milliseconds 200
+  $fs = [IO.File]::Open($log, 'Open', 'Read', 'ReadWrite'); $fs.Seek($mark, 'Begin') | Out-Null
+  $new = (New-Object IO.StreamReader($fs, [Text.Encoding]::UTF8)).ReadToEnd(); $fs.Close()
+  $done = $new -match '完成 |交还系统'
+  if ($Focus -ne 'list' -and $sw.Elapsed.TotalSeconds -gt 3) { break }   # 放行的情况不会有日志
+}
+if ($Focus -ne 'list') { [K]::Keys(0x1B) }   # Esc 退出编辑
+Start-Sleep -Milliseconds 300
+$fs = [IO.File]::Open($log, 'Open', 'Read', 'ReadWrite'); $fs.Seek($mark, 'Begin') | Out-Null
+(New-Object IO.StreamReader($fs, [Text.Encoding]::UTF8)).ReadToEnd(); $fs.Close()
+$n = (Get-ChildItem -LiteralPath $Dest -Recurse -File -Force | Measure-Object).Count
+"目标文件数 $n"
+if (-not $before.Contains($win.HWND)) { $win.Quit() }

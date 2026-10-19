@@ -4,6 +4,8 @@
 
 mod exec;
 mod plan;
+pub mod session;
+pub mod ticket;
 mod win;
 
 pub use exec::{execute, Options, Progress, Report, Resolution};
