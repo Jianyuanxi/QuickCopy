@@ -33,6 +33,7 @@ public static class K {
     GetGUIThreadInfo(GetWindowThreadProcessId(fg, IntPtr.Zero), ref g); return Cls(g.focus); }
   public static void Fg(IntPtr h) { keybd_event(0x12, 0, 0, UIntPtr.Zero); SetForegroundWindow(h); keybd_event(0x12, 0, 2, UIntPtr.Zero); }
   [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
+  [DllImport("user32.dll")] public static extern bool PostMessageW(IntPtr h, uint m, IntPtr w, IntPtr l);
   [DllImport("user32.dll")] public static extern void mouse_event(uint f, int x, int y, uint d, UIntPtr e);
   [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
   [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
@@ -150,4 +151,11 @@ $fs = [IO.File]::Open($log, 'Open', 'Read', 'ReadWrite'); $fs.Seek($mark, 'Begin
 (New-Object IO.StreamReader($fs, [Text.Encoding]::UTF8)).ReadToEnd(); $fs.Close()
 $n = (Get-ChildItem -LiteralPath $Dest -Recurse -File -Force | Measure-Object).Count
 "目标文件数 $n"
-if (-not $before.Contains($win.HWND)) { $win.Quit() }
+# 关掉本次新开的窗口。带多个标签页时 WM_CLOSE 一次只关一个标签页，要关到窗口消失为止
+if (-not $before.Contains($win.HWND)) {
+  $hw = $win.HWND
+  for ($i = 0; $i -lt 10 -and ($shell.Windows() | Where-Object { $_.HWND -eq $hw }); $i++) {
+    [K]::PostMessageW([IntPtr]$hw, 0x10, [IntPtr]::Zero, [IntPtr]::Zero) | Out-Null
+    Start-Sleep -Milliseconds 300
+  }
+}

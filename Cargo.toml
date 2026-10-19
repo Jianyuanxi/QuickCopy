@@ -1,6 +1,8 @@
 [workspace]
 resolver = "2"
 members = ["crates/*"]
+# Tauri 版只留作对照，不参与构建（界面已定用 Win32）
+exclude = ["crates/qc-ui-tauri"]
 
 [workspace.package]
 edition = "2021"

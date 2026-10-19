@@ -33,7 +33,7 @@
   - 它的触发方式：一个只接收消息的窗口注册全局热键，配合 SetWinEventHook 判断前台是不是 CabinetWClass 窗口或桌面，再从剪贴板的 CF_HDROP 读出文件列表。它用的是 Ctrl+Shift+V，我们要接管 Ctrl+V 本身。
   - 它的引擎：大文件用 CopyFileExW 加 NO_BUFFERING，按盘的类型自动调线程数。
 - 剪切和复制的区分：读剪贴板的 `Preferred DropEffect`。
-- 界面：进度窗口和冲突对话框要像系统原生的。用什么做（Tauri / WinUI / Win32）开工时再定。
+- 界面：进度窗口和冲突对话框要像系统原生的。**已定用 Win32**（crates/qc-ui-win32，2026-10-19 用户拍板）。两版实测：Win32 私有内存约 16 MB、复制满载时按键后约 0.5 s 出窗口；Tauri 连 WebView2 共 7 个进程、约 235 MB，要 1.7–3.3 s，复制速度一样，没有优势。crates/qc-ui-tauri 只留作对照，已排除出 workspace，不再维护。
 
 ## 实测基准（2026-10-18，本机 C 盘拷到 E 盘，E 盘是 WD SN5000）
 
