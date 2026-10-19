@@ -12,6 +12,12 @@ pub struct Ticket {
     pub job: Job,
     /// 按下 Ctrl+V 的时刻（Unix 毫秒），界面进程用它算“按键到窗口出现”的延迟。
     pub key_ms: u64,
+    /// 撤销任务：撤销日志里这一条（`job` 不用）。
+    #[serde(default)]
+    pub undo: Option<crate::undo::Op>,
+    /// 读剪贴板时的剪贴板序号。剪切粘贴做完后，剪贴板没被别人改过才清空它，和资源管理器一样。
+    #[serde(default)]
+    pub clip_seq: u32,
 }
 
 pub fn now_ms() -> u64 {

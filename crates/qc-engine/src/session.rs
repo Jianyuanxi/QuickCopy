@@ -6,7 +6,8 @@ use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use crate::{execute, plan, FileItem, Job, Options, Plan, Progress, Report, Resolution};
+use crate::undo::{self, Op};
+use crate::{execute, prepare, FileItem, Job, Options, Plan, Progress, Report, Resolution};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Phase {
@@ -25,6 +26,8 @@ pub struct Decision {
 
 pub struct Session {
     pub job: Job,
+    /// 撤销会话：要撤销的那条操作。
+    pub undo: Option<Op>,
     pub prog: Progress,
     pub plan: OnceLock<Plan>,
     pub report: OnceLock<Report>,
@@ -50,9 +53,20 @@ pub struct Snapshot {
 
 impl Session {
     pub fn start(job: Job) -> Arc<Session> {
+        Self::spawn(job, None)
+    }
+
+    /// 撤销一条操作，界面和粘贴共用同一套进度显示。
+    pub fn start_undo(op: Op) -> Arc<Session> {
+        let job = Job { sources: Vec::new(), dest: op.dest.clone(), mode: op.mode };
+        Self::spawn(job, Some(op))
+    }
+
+    fn spawn(job: Job, undo: Option<Op>) -> Arc<Session> {
         let (tx, rx) = sync_channel(1);
         let s = Arc::new(Session {
             job,
+            undo,
             prog: Progress::default(),
             plan: OnceLock::new(),
             report: OnceLock::new(),
@@ -68,7 +82,13 @@ impl Session {
     }
 
     fn run(&self, rx: Receiver<Decision>) {
-        let p = match plan(&self.job) {
+        if let Some(op) = &self.undo {
+            self.phase.store(Phase::Copying as u8, Relaxed);
+            let _ = self.report.set(undo::undo(op, &self.prog));
+            self.phase.store(Phase::Done as u8, Relaxed);
+            return;
+        }
+        let p = match prepare(&self.job) {
             Ok(p) => p,
             Err(e) => {
                 let _ = self.error.set(e);
@@ -92,6 +112,11 @@ impl Session {
         let index = |f: &FileItem| (f as *const FileItem as usize - plan.files.as_ptr() as usize) / size_of::<FileItem>();
         let resolve = |f: &FileItem| *decision.per_file.get(&index(f)).unwrap_or(&decision.default);
         let r = execute(plan, &Options::default(), &self.prog, &resolve);
+        if r.changed_anything() {
+            if let Err(e) = undo::record(Op::from_report(&self.job, &r)) {
+                crate::ticket::log(&format!("记撤销日志失败：{e}"));
+            }
+        }
         let _ = self.report.set(r);
         self.phase.store(Phase::Done as u8, Relaxed);
     }

@@ -7,8 +7,9 @@ use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Mode {
+    #[default]
     Copy,
     Move,
 }
@@ -39,15 +40,24 @@ pub struct FileItem {
     pub size: u64,
     pub conflict: bool,
     pub top: u32,
+    /// 只在改名计划里出现：整个文件夹一次改名过去。
+    pub is_dir: bool,
 }
 
 #[derive(Debug, Default)]
 pub struct Plan {
+    /// Move 且不是改名计划时：复制完核对大小，再删源。
+    pub mode: Mode,
     pub tops: Vec<TopItem>,
     /// 需要新建的目标目录。
     pub dirs: Vec<PathBuf>,
+    /// 复制计划：要复制的文件；改名计划：要改名的文件或整个文件夹。
     pub files: Vec<FileItem>,
     pub total_bytes: u64,
+    /// 移动完成后要删掉的源文件夹（空了才删），深的在前。
+    pub src_dirs: Vec<PathBuf>,
+    /// 同盘移动：直接改名，不复制。
+    pub rename: bool,
     /// 没有展开的目录符号链接 / 联接点。
     pub skipped_links: Vec<PathBuf>,
     pub errors: Vec<(PathBuf, String)>,
@@ -108,67 +118,106 @@ fn split_name(p: &Path) -> (String, String) {
     }
 }
 
-#[derive(Default)]
-struct Acc {
-    dirs: Vec<PathBuf>,
-    files: Vec<FileItem>,
-    bytes: u64,
-    links: Vec<PathBuf>,
-    errors: Vec<(PathBuf, String)>,
+/// 一个顶层条目从 `src` 到 `dst`。源和目标一个是文件一个是文件夹时没法合并也不能替换，返回错误。
+pub fn top_item(src: &Path, dst: &Path) -> Result<TopItem, String> {
+    let meta = fs::symlink_metadata(src).map_err(|e| e.to_string())?;
+    let is_dir = meta.is_dir();
+    let existing = fs::symlink_metadata(dst).ok();
+    if let Some(m) = &existing {
+        if m.is_dir() != is_dir {
+            return Err(if is_dir { "目标位置已有同名文件，没法放文件夹".into() } else { "目标位置已有同名文件夹，没法放文件".into() });
+        }
+    }
+    Ok(TopItem {
+        src: src.to_path_buf(),
+        dst: dst.to_path_buf(),
+        is_dir,
+        merge: is_dir && existing.is_some(),
+        conflict: !is_dir && existing.is_some(),
+    })
 }
 
-pub fn plan(job: &Job) -> Result<Plan, String> {
+/// 把任务展开成顶层条目。原地移动的条目直接略过，原地复制按资源管理器的规则起“ - 副本”名。
+fn build_tops(job: &Job) -> Result<(Vec<TopItem>, Vec<(PathBuf, String)>), String> {
     if !job.dest.is_dir() {
         return Err(format!("目标不是文件夹：{}", job.dest.display()));
     }
-    let mut out = Plan::default();
+    let (mut tops, mut errors) = (Vec::new(), Vec::new());
     for src in &job.sources {
-        let meta = fs::symlink_metadata(src).map_err(|e| format!("{}：{e}", src.display()))?;
         let name = src.file_name().ok_or_else(|| format!("无效路径：{}", src.display()))?;
-        let is_dir = meta.is_dir();
         let in_place = src.parent().is_some_and(|p| same_path(p, &job.dest));
         if in_place && job.mode == Mode::Move {
             continue; // 移动到原地，什么都不做
         }
-        if is_dir && is_under(&job.dest, src) {
+        if src.is_dir() && is_under(&job.dest, src) {
             return Err(format!("目标文件夹在源文件夹里面：{}", src.display()));
         }
         let mut dst = job.dest.join(name);
         if in_place {
             dst = copy_name(&dst);
         }
-        let existing = fs::symlink_metadata(&dst).ok();
-        let top = TopItem {
-            src: src.clone(),
-            dst: dst.clone(),
-            is_dir,
-            merge: is_dir && existing.as_ref().is_some_and(|m| m.is_dir()),
-            conflict: existing.as_ref().is_some_and(|m| !m.is_dir() || !is_dir),
-        };
-        out.tops.push(top);
+        match top_item(src, &dst) {
+            Ok(t) => tops.push(t),
+            Err(e) => errors.push((src.clone(), e)),
+        }
     }
+    Ok((tops, errors))
+}
 
+#[derive(Default)]
+struct Acc {
+    dirs: Vec<PathBuf>,
+    src_dirs: Vec<PathBuf>,
+    files: Vec<FileItem>,
+    bytes: u64,
+    links: Vec<PathBuf>,
+    errors: Vec<(PathBuf, String)>,
+}
+
+/// 复制计划（跨盘移动也用它：先复制，再删源）。
+pub fn plan(job: &Job) -> Result<Plan, String> {
+    let (tops, errors) = build_tops(job)?;
+    let mut p = expand(tops);
+    p.mode = job.mode;
+    p.errors.splice(0..0, errors);
+    Ok(p)
+}
+
+/// 按任务选计划：移动且源和目标在同一个卷上就改名，否则复制（移动的再删源）。
+pub fn prepare(job: &Job) -> Result<Plan, String> {
+    if job.mode == Mode::Move && job.sources.iter().all(|s| crate::win::same_volume(s, &job.dest)) {
+        rename_plan(job)
+    } else {
+        plan(job)
+    }
+}
+
+/// 把顶层条目展开成要建的目录和要复制的文件。
+pub fn expand(tops: Vec<TopItem>) -> Plan {
+    let mut out = Plan { tops, ..Default::default() };
     let acc = Mutex::new(Acc::default());
     rayon::scope(|s| {
         for (i, t) in out.tops.iter().enumerate() {
             let i = i as u32;
-            if t.is_dir && !t.conflict {
+            if t.is_dir {
                 if !t.merge {
                     acc.lock().unwrap().dirs.push(t.dst.clone());
                 }
                 let (src, dst, merge) = (t.src.clone(), t.dst.clone(), t.merge);
                 let acc = &acc;
                 s.spawn(move |s| walk(s, src, dst, merge, i, acc));
-            } else if !t.is_dir {
+            } else {
                 let size = fs::metadata(&t.src).map(|m| m.len()).unwrap_or(0);
                 let mut a = acc.lock().unwrap();
                 a.bytes += size;
-                a.files.push(FileItem { src: t.src.clone(), dst: t.dst.clone(), size, conflict: t.conflict, top: i });
+                a.files.push(FileItem { src: t.src.clone(), dst: t.dst.clone(), size, conflict: t.conflict, top: i, is_dir: false });
             }
         }
     });
     let a = acc.into_inner().unwrap();
     out.dirs = a.dirs;
+    out.src_dirs = a.src_dirs;
+    out.src_dirs.sort_by_key(|p| std::cmp::Reverse(p.components().count()));
     out.files = a.files;
     out.total_bytes = a.bytes;
     out.skipped_links = a.links;
@@ -176,7 +225,7 @@ pub fn plan(job: &Job) -> Result<Plan, String> {
     out.files = interleave(out.files);
     // 大文件排前面，避免最后剩一个大文件单线程拖尾
     out.files.sort_by_key(|f| std::cmp::Reverse(f.size >= crate::BIG_FILE));
-    Ok(out)
+    out
 }
 
 /// 按目录轮流取文件，让并发的线程落在不同目录里，减少抢同一个目录的锁。
@@ -238,21 +287,69 @@ fn walk<'s>(s: &rayon::Scope<'s>, src: PathBuf, dst: PathBuf, check: bool, top: 
         if ft.is_symlink() && meta.is_dir() {
             local.links.push(e.path());
         } else if ft.is_dir() {
+            if exists && !child_dst.is_dir() {
+                local.errors.push((e.path(), "目标位置已有同名文件，没法放文件夹".into()));
+                continue;
+            }
             if !exists {
                 local.dirs.push(child_dst.clone());
             }
             let p = e.path();
             s.spawn(move |s| walk(s, p, child_dst, exists, top, acc));
         } else {
+            if exists && child_dst.is_dir() {
+                local.errors.push((e.path(), "目标位置已有同名文件夹，没法放文件".into()));
+                continue;
+            }
             let size = meta.len();
             local.bytes += size;
-            local.files.push(FileItem { src: e.path(), dst: child_dst, size, conflict: exists, top });
+            local.files.push(FileItem { src: e.path(), dst: child_dst, size, conflict: exists, top, is_dir: false });
         }
     }
     let mut a = acc.lock().unwrap();
+    a.src_dirs.push(src);
     a.dirs.append(&mut local.dirs);
     a.files.append(&mut local.files);
     a.bytes += local.bytes;
     a.links.append(&mut local.links);
     a.errors.append(&mut local.errors);
+}
+
+/// 同盘移动的计划：目标没有同名的就整个改名过去（文件夹也是一次改名），
+/// 只有合并进已有文件夹时才往里走，逐个处理。
+pub fn rename_plan(job: &Job) -> Result<Plan, String> {
+    let (tops, errors) = build_tops(job)?;
+    let mut out = Plan { mode: Mode::Move, rename: true, errors, ..Default::default() };
+    for (i, t) in tops.iter().enumerate() {
+        let i = i as u32;
+        if t.merge {
+            rename_walk(&t.src, &t.dst, i, &mut out);
+        } else {
+            let size = if t.is_dir { 0 } else { fs::metadata(&t.src).map(|m| m.len()).unwrap_or(0) };
+            out.total_bytes += size;
+            out.files.push(FileItem { src: t.src.clone(), dst: t.dst.clone(), size, conflict: t.conflict, top: i, is_dir: t.is_dir });
+        }
+    }
+    out.tops = tops;
+    Ok(out)
+}
+
+fn rename_walk(src: &Path, dst: &Path, top: u32, out: &mut Plan) {
+    let rd = match fs::read_dir(src) {
+        Ok(rd) => rd,
+        Err(e) => return out.errors.push((src.to_path_buf(), e.to_string())),
+    };
+    for e in rd.flatten() {
+        let child_dst = dst.join(e.file_name());
+        match top_item(&e.path(), &child_dst) {
+            Ok(t) if t.merge => rename_walk(&t.src, &t.dst, top, out),
+            Ok(t) => {
+                let size = if t.is_dir { 0 } else { e.metadata().map(|m| m.len()).unwrap_or(0) };
+                out.total_bytes += size;
+                out.files.push(FileItem { src: t.src, dst: t.dst, size, conflict: t.conflict, top, is_dir: t.is_dir });
+            }
+            Err(err) => out.errors.push((e.path(), err)),
+        }
+    }
+    out.src_dirs.push(src.to_path_buf()); // 后序：子目录先进
 }

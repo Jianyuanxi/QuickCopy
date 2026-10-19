@@ -9,6 +9,12 @@ param(
   [switch]$Desktop,
   # 多标签页：窗口开到 $Dest 后 Ctrl+T 新开标签页，转到 $TabTo，应该粘贴进 $TabTo 而不是 $Dest
   [string]$TabTo = '',
+  # V 粘贴 / Z 撤销（撤销不碰剪贴板）
+  [ValidateSet('V', 'Z')] [string]$Key = 'V',
+  # 冲突对话框依次怎么点，逗号隔开：replace / skip / keep / cancel，后面加 ! 表示勾上“对剩下的都这样”
+  [string]$Dialog = '',
+  # 第一个冲突对话框出现时截图存到这里
+  [string]$Shot = '',
   [int]$TimeoutS = 30
 )
 # 端到端：常驻进程 + 真实资源管理器窗口。把文件放进剪贴板，开一个资源管理器窗口到 $Dest，
@@ -54,11 +60,45 @@ public static class K {
   public static void Keys(params byte[] vks) {
     foreach (var v in vks) keybd_event(v, 0, 0, UIntPtr.Zero);
     for (int i = vks.Length - 1; i >= 0; i--) keybd_event(vks[i], 0, 2, UIntPtr.Zero); }
+  public static byte Vk = 0x56;
   public static void CtrlV() {
-    keybd_event(0x11, 0, 0, UIntPtr.Zero); keybd_event(0x56, 0, 0, UIntPtr.Zero);
-    keybd_event(0x56, 0, 2, UIntPtr.Zero); keybd_event(0x11, 0, 2, UIntPtr.Zero); }
+    keybd_event(0x11, 0, 0, UIntPtr.Zero); keybd_event(Vk, 0, 0, UIntPtr.Zero);
+    keybd_event(Vk, 0, 2, UIntPtr.Zero); keybd_event(0x11, 0, 2, UIntPtr.Zero); }
+  [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern IntPtr FindWindowW(string c, string t);
+  [DllImport("user32.dll")] public static extern IntPtr SendMessageW(IntPtr h, uint m, IntPtr w, IntPtr l);
+  [DllImport("user32.dll")] public static extern bool PrintWindow(IntPtr h, IntPtr hdc, uint f);
+  [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
 }
 '@
+Add-Type -AssemblyName System.Drawing
+[K]::SetProcessDPIAware() | Out-Null
+[K]::Vk = if ($Key -eq 'Z') { 0x5A } else { 0x56 }
+$dialogQueue = [Collections.Generic.Queue[string]]::new()
+if ($Dialog) { $Dialog -split ',' | ForEach-Object { $dialogQueue.Enqueue($_.Trim()) } }
+$shotDone = $false
+# 看到冲突对话框就按队列点按钮：TDM_CLICK_VERIFICATION / TDM_CLICK_BUTTON 跨进程也能发
+function Answer-Dialog {
+  $d = [K]::FindWindowW('#32770', '替换或跳过文件')
+  if ($d -eq [IntPtr]::Zero -or -not [K]::IsWindowVisible($d)) { return }
+  Start-Sleep -Milliseconds 300
+  if ($Shot -and -not $script:shotDone) {
+    $r = New-Object K+RECT; [K]::GetWindowRect($d, [ref]$r) | Out-Null
+    $bmp = New-Object Drawing.Bitmap ($r.R - $r.L), ($r.B - $r.T)
+    $g = [Drawing.Graphics]::FromImage($bmp); $hdc = $g.GetHdc()
+    [K]::PrintWindow($d, $hdc, 2) | Out-Null
+    $g.ReleaseHdc($hdc); $g.Dispose(); $bmp.Save($Shot); $bmp.Dispose()
+    $script:shotDone = $true
+    "截图 $Shot"
+  }
+  if ($dialogQueue.Count -eq 0) { "对话框出现但没有安排怎么点"; return }
+  $a = $dialogQueue.Dequeue()
+  $all = $a.EndsWith('!'); $a = $a.TrimEnd('!')
+  $id = @{ replace = 1001; skip = 1002; keep = 1003; cancel = 2 }[$a]
+  if ($all) { [K]::SendMessageW($d, 0x471, [IntPtr]1, [IntPtr]0) | Out-Null }
+  [K]::SendMessageW($d, 0x466, [IntPtr]$id, [IntPtr]0) | Out-Null
+  "对话框：点 $a$(if ($all) { '（对剩下的都这样）' })"
+  Start-Sleep -Milliseconds 300
+}
 
 $root = Resolve-Path "$PSScriptRoot\.."
 $log = Join-Path $env:LOCALAPPDATA 'QuickCopy\quickcopy.log'
@@ -68,14 +108,16 @@ Start-Sleep -Milliseconds 300
 Start-Process "$root\target\release\quickcopy.exe" -ArgumentList '--ui', $Ui
 Start-Sleep -Milliseconds 500
 
-$files = New-Object System.Collections.Specialized.StringCollection
-# pwsh -File 传不了数组，多个源用 | 隔开
-$Src -split '\|' | ForEach-Object { [void]$files.Add((Resolve-Path $_).Path) }
-$data = New-Object System.Windows.Forms.DataObject
-$data.SetFileDropList($files)
-$effect = if ($Cut) { 2 } else { 5 }
-$data.SetData('Preferred DropEffect', (New-Object IO.MemoryStream (, [BitConverter]::GetBytes([int]$effect))))
-[System.Windows.Forms.Clipboard]::SetDataObject($data, $true)
+if ($Key -eq 'V') {
+  $files = New-Object System.Collections.Specialized.StringCollection
+  # pwsh -File 传不了数组，多个源用 | 隔开
+  $Src -split '\|' | ForEach-Object { [void]$files.Add((Resolve-Path $_).Path) }
+  $data = New-Object System.Windows.Forms.DataObject
+  $data.SetFileDropList($files)
+  $effect = if ($Cut) { 2 } else { 5 }
+  $data.SetData('Preferred DropEffect', (New-Object IO.MemoryStream (, [BitConverter]::GetBytes([int]$effect))))
+  [System.Windows.Forms.Clipboard]::SetDataObject($data, $true)
+}
 
 if ($Desktop) {
   $Dest = [Environment]::GetFolderPath('Desktop')
@@ -140,6 +182,7 @@ $sw = [Diagnostics.Stopwatch]::StartNew()
 $done = $false
 while (-not $done -and $sw.Elapsed.TotalSeconds -lt $TimeoutS) {
   Start-Sleep -Milliseconds 200
+  Answer-Dialog
   $fs = [IO.File]::Open($log, 'Open', 'Read', 'ReadWrite'); $fs.Seek($mark, 'Begin') | Out-Null
   $new = (New-Object IO.StreamReader($fs, [Text.Encoding]::UTF8)).ReadToEnd(); $fs.Close()
   $done = $new -match '完成 |交还系统'
@@ -151,6 +194,9 @@ $fs = [IO.File]::Open($log, 'Open', 'Read', 'ReadWrite'); $fs.Seek($mark, 'Begin
 (New-Object IO.StreamReader($fs, [Text.Encoding]::UTF8)).ReadToEnd(); $fs.Close()
 $n = (Get-ChildItem -LiteralPath $Dest -Recurse -File -Force | Measure-Object).Count
 "目标文件数 $n"
+if ($Key -eq 'V' -and $Cut) {
+  "剪贴板还有文件：$([System.Windows.Forms.Clipboard]::ContainsFileDropList())"
+}
 # 关掉本次新开的窗口。带多个标签页时 WM_CLOSE 一次只关一个标签页，要关到窗口消失为止
 if (-not $before.Contains($win.HWND)) {
   $hw = $win.HWND

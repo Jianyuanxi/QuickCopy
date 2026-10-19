@@ -1,13 +1,17 @@
 //! QuickCopy 进度窗口（Win32 原生控件版）。参数：任务单 JSON 路径。
+//! 粘贴和撤销都走这里：扫描 → 有冲突就逐个问 → 执行，超过 300ms 才显示进度窗口。
 #![windows_subsystem = "windows"]
 
 use std::cell::RefCell;
+use std::collections::HashMap;
+use std::os::windows::fs::MetadataExt;
+use std::path::Path;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use qc_engine::session::{fmt_bytes, fmt_eta, Decision, Phase, Session};
 use qc_engine::ticket::{log, now_ms, take_ticket};
-use qc_engine::Resolution;
+use qc_engine::{numbered_name, FileItem, Mode, Resolution};
 use windows::core::{w, HSTRING, PCWSTR};
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Gdi::*;
@@ -40,6 +44,11 @@ struct Ui {
     ready_ms: u64,
     shown_ms: u64,
     foreground: bool,
+    clip_seq: u32,
+    /// 正在弹冲突对话框（对话框自带消息循环，期间计时器还会进来）。
+    asking: bool,
+    /// 问完冲突的时刻；进度窗口的延迟从这里重新算，免得答完对话框就闪一下进度窗口。
+    answered: Option<std::time::Instant>,
 }
 
 thread_local! {
@@ -92,9 +101,18 @@ fn main() {
             None,
         )
         .unwrap();
-        UI.with(|u| u.borrow_mut().key_ms = ticket.key_ms);
-        build(hwnd, &ticket.job);
-        SESSION.set(Session::start(ticket.job.clone())).ok();
+        UI.with(|u| {
+            let mut u = u.borrow_mut();
+            u.key_ms = ticket.key_ms;
+            u.clip_seq = ticket.clip_seq;
+        });
+        let undoing = ticket.undo.is_some();
+        build(hwnd, &ticket.job, undoing);
+        let session = match ticket.undo {
+            Some(op) => Session::start_undo(op),
+            None => Session::start(ticket.job.clone()),
+        };
+        SESSION.set(session).ok();
         let ready = now_ms();
         UI.with(|u| {
             let mut u = u.borrow_mut();
@@ -137,7 +155,16 @@ unsafe fn child(parent: HWND, class: PCWSTR, text: &str, style: u32, id: usize) 
 }
 
 /// 建控件并按 DPI 排版。
-unsafe fn build(hwnd: HWND, job: &qc_engine::Job) {
+/// 窗口标题和第一行用的动词。
+fn verb(job: &qc_engine::Job, undoing: bool) -> &'static str {
+    match (undoing, job.mode) {
+        (true, _) => "撤销",
+        (false, Mode::Copy) => "复制",
+        (false, Mode::Move) => "移动",
+    }
+}
+
+unsafe fn build(hwnd: HWND, job: &qc_engine::Job, undoing: bool) {
     let dpi = GetDpiForWindow(hwnd).max(96);
     let mut ncm = NONCLIENTMETRICSW { cbSize: size_of::<NONCLIENTMETRICSW>() as u32, ..Default::default() };
     let _ = SystemParametersInfoForDpi(SPI_GETNONCLIENTMETRICS.0, ncm.cbSize, Some(&mut ncm as *mut _ as _), 0, dpi);
@@ -145,7 +172,9 @@ unsafe fn build(hwnd: HWND, job: &qc_engine::Job) {
     const SS_ENDELLIPSIS: u32 = 0x4000;
     const SS_PATHELLIPSIS: u32 = 0x8000;
     let n = job.sources.len();
-    let title = format!("正在复制 {n} 个项目到 {}", job.dest.display());
+    let v = verb(job, undoing);
+    let title = if undoing { format!("正在撤销对 {} 的操作", job.dest.display()) } else { format!("正在{v} {n} 个项目到 {}", job.dest.display()) };
+    let _ = SetWindowTextW(hwnd, &HSTRING::from(format!("正在{v}")));
     let st = w!("STATIC");
     let mut u = UI.with(|u| std::mem::take(&mut *u.borrow_mut()));
     u.font = font;
@@ -190,8 +219,19 @@ unsafe fn tick(hwnd: HWND) {
     let session = SESSION.get().unwrap();
     let snap = session.snapshot();
     if snap.phase == Phase::NeedDecision {
-        // 样张阶段：冲突一律跳过，结束时列出来
-        session.decide(Decision { default: Resolution::Skip, per_file: Default::default() });
+        if UI.with(|u| std::mem::replace(&mut u.borrow_mut().asking, true)) {
+            return;
+        }
+        match ask_conflicts(hwnd, session) {
+            Some(d) => session.decide(d),
+            None => session.cancel(),
+        }
+        UI.with(|u| {
+            let mut u = u.borrow_mut();
+            u.asking = false;
+            u.answered = Some(std::time::Instant::now());
+        });
+        return;
     }
     if snap.phase == Phase::Done {
         let _ = KillTimer(Some(hwnd), 1);
@@ -200,7 +240,8 @@ unsafe fn tick(hwnd: HWND) {
     }
     UI.with(|cell| {
         let mut u = cell.borrow_mut();
-        if !u.shown && session.started.elapsed() >= SHOW_DELAY {
+        let since = u.answered.map_or(session.started.elapsed(), |t| t.elapsed());
+        if !u.shown && since >= SHOW_DELAY {
             u.shown = true;
             let _ = ShowWindow(hwnd, SW_SHOWNORMAL);
             let _ = SetForegroundWindow(hwnd);
@@ -244,9 +285,10 @@ unsafe fn tick(hwnd: HWND) {
 
 unsafe fn finish(hwnd: HWND) {
     let session = SESSION.get().unwrap();
+    let v = verb(&session.job, session.undo.is_some());
     let mut lines = Vec::new();
     if let Some(e) = session.error.get() {
-        lines.push(format!("无法复制：{e}"));
+        lines.push(format!("无法{v}：{e}"));
     }
     let timing = UI.with(|u| {
         let u = u.borrow();
@@ -256,21 +298,22 @@ unsafe fn finish(hwnd: HWND) {
     log(&format!("win32: {timing} 峰值内存 {}", qc_engine::ticket::peak_memory()));
     if let Some(r) = session.report.get() {
         log(&format!(
-            "win32: 完成 {} 个文件 {:.1}MB 用时 {:.2}s 跳过 {} 失败 {} 取消 {}",
+            "win32: {v}完成 {} 个文件 {:.1}MB 用时 {:.2}s 跳过 {} 失败 {} 备份 {} 取消 {}",
             r.copied_files,
             r.copied_bytes as f64 / 1048576.0,
             r.elapsed.as_secs_f64(),
             r.skipped.len(),
             r.failures.len(),
+            r.backups.len(),
             r.cancelled
         ));
-        if !r.skipped.is_empty() {
-            let names: Vec<String> = r.skipped.iter().take(5).map(|p| p.display().to_string()).collect();
-            lines.push(format!("目标位置已有同名文件，跳过了 {} 个（样张阶段一律不覆盖）：\n{}", r.skipped.len(), names.join("\n")));
-        }
         if !r.failures.is_empty() {
             let names: Vec<String> = r.failures.iter().take(5).map(|(p, e)| format!("{}：{e}", p.display())).collect();
-            lines.push(format!("{} 个文件复制失败：\n{}", r.failures.len(), names.join("\n")));
+            let more = if r.failures.len() > 5 { "\n…" } else { "" };
+            lines.push(format!("{} 项没能{v}：\n{}{more}", r.failures.len(), names.join("\n")));
+        }
+        if session.job.mode == Mode::Move && session.undo.is_none() && !r.moved.is_empty() {
+            clear_clipboard(UI.with(|u| u.borrow().clip_seq));
         }
     }
     if !lines.is_empty() {
@@ -315,4 +358,115 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
         }
         _ => DefWindowProcW(hwnd, msg, wp, lp),
     }
+}
+
+/// 剪切粘贴做完后清空剪贴板（剪贴板在这期间被别的程序改过就不动）。
+unsafe fn clear_clipboard(seq: u32) {
+    use windows::Win32::System::DataExchange::{CloseClipboard, EmptyClipboard, GetClipboardSequenceNumber, OpenClipboard};
+    if seq == 0 || GetClipboardSequenceNumber() != seq {
+        return;
+    }
+    if OpenClipboard(None).is_ok() {
+        let _ = EmptyClipboard();
+        let _ = CloseClipboard();
+    }
+}
+
+/// 逐个问冲突怎么处理。返回 None 表示用户取消整个操作。
+unsafe fn ask_conflicts(hwnd: HWND, session: &Session) -> Option<Decision> {
+    let plan = session.plan.get()?;
+    let idx: Vec<usize> = plan.files.iter().enumerate().filter(|(_, f)| f.conflict).map(|(i, _)| i).collect();
+    let mut per_file = HashMap::new();
+    for (k, &i) in idx.iter().enumerate() {
+        let (res, all) = conflict_dialog(hwnd, &plan.files[i], idx.len() - k - 1)?;
+        if all {
+            return Some(Decision { default: res, per_file });
+        }
+        per_file.insert(i, res);
+    }
+    Some(Decision { default: Resolution::Skip, per_file })
+}
+
+/// 文件的大小和修改时间，形如 `12.3 KB，修改于 2026/10/19 14:05`。
+fn describe(p: &Path) -> (String, u64) {
+    let Ok(m) = std::fs::metadata(p) else { return ("读不到".into(), 0) };
+    let ft = m.last_write_time();
+    let mut when = String::new();
+    unsafe {
+        use windows::Win32::System::Time::{FileTimeToSystemTime, SystemTimeToTzSpecificLocalTime};
+        let f = FILETIME { dwLowDateTime: ft as u32, dwHighDateTime: (ft >> 32) as u32 };
+        let (mut utc, mut local) = (SYSTEMTIME::default(), SYSTEMTIME::default());
+        if FileTimeToSystemTime(&f, &mut utc).is_ok() && SystemTimeToTzSpecificLocalTime(None, &utc, &mut local).is_ok() {
+            when = format!("，修改于 {}/{}/{} {:02}:{:02}", local.wYear, local.wMonth, local.wDay, local.wHour, local.wMinute);
+        }
+    }
+    (format!("{}{when}", fmt_bytes(m.len() as f64)), ft)
+}
+
+const ID_REPLACE: i32 = 1001;
+const ID_SKIP: i32 = 1002;
+const ID_KEEP: i32 = 1003;
+
+unsafe extern "system" fn dialog_proc(h: HWND, msg: TASKDIALOG_NOTIFICATIONS, _: WPARAM, _: LPARAM, _: isize) -> windows::core::HRESULT {
+    if msg == TDN_CREATED {
+        let _ = SetForegroundWindow(h);
+    }
+    windows::core::HRESULT(0)
+}
+
+/// 一个冲突的对话框：替换 / 跳过 / 都保留，外加“对剩下的都这样”。
+unsafe fn conflict_dialog(owner: HWND, f: &FileItem, remaining: usize) -> Option<(Resolution, bool)> {
+    let name = f.dst.file_name().unwrap_or_default().to_string_lossy().into_owned();
+    let (src_info, src_t) = describe(&f.src);
+    let (dst_info, dst_t) = describe(&f.dst);
+    let newer = |a: u64, b: u64| if a > b { "（较新）" } else { "" };
+    let parent = |p: &Path| p.parent().map(|d| d.display().to_string()).unwrap_or_default();
+    let keep_name = (2..).map(|n| numbered_name(&f.dst, n)).find(|p| !p.exists()).unwrap();
+    let keep_name = keep_name.file_name().unwrap_or_default().to_string_lossy().into_owned();
+
+    let title = HSTRING::from("替换或跳过文件");
+    let main = HSTRING::from(format!("目标位置已有名为“{name}”的文件"));
+    let content = HSTRING::from(format!(
+        "来源：{}\n    {src_info}{}\n目标：{}\n    {dst_info}{}",
+        parent(&f.src),
+        newer(src_t, dst_t),
+        parent(&f.dst),
+        newer(dst_t, src_t)
+    ));
+    let b_replace = HSTRING::from("替换目标中的文件\n旧文件先留作备份，按 Ctrl+Z 可以撤销");
+    let b_skip = HSTRING::from("跳过此文件\n目标中的文件保持不变");
+    let b_keep = HSTRING::from(format!("保留两个文件\n来源文件改名为“{keep_name}”"));
+    let verify = HSTRING::from(format!("对剩下的 {remaining} 个冲突都这样处理"));
+    let buttons = [
+        TASKDIALOG_BUTTON { nButtonID: ID_REPLACE, pszButtonText: PCWSTR(b_replace.as_ptr()) },
+        TASKDIALOG_BUTTON { nButtonID: ID_SKIP, pszButtonText: PCWSTR(b_skip.as_ptr()) },
+        TASKDIALOG_BUTTON { nButtonID: ID_KEEP, pszButtonText: PCWSTR(b_keep.as_ptr()) },
+    ];
+    let cfg = TASKDIALOGCONFIG {
+        cbSize: size_of::<TASKDIALOGCONFIG>() as u32,
+        hwndParent: if IsWindowVisible(owner).as_bool() { owner } else { HWND::default() },
+        dwFlags: TDF_USE_COMMAND_LINKS | TDF_ALLOW_DIALOG_CANCELLATION | TDF_POSITION_RELATIVE_TO_WINDOW,
+        dwCommonButtons: TDCBF_CANCEL_BUTTON,
+        pszWindowTitle: PCWSTR(title.as_ptr()),
+        pszMainInstruction: PCWSTR(main.as_ptr()),
+        pszContent: PCWSTR(content.as_ptr()),
+        cButtons: buttons.len() as u32,
+        pButtons: buttons.as_ptr(),
+        nDefaultButton: ID_SKIP,
+        pszVerificationText: if remaining > 0 { PCWSTR(verify.as_ptr()) } else { PCWSTR::null() },
+        pfCallback: Some(dialog_proc),
+        ..Default::default()
+    };
+    let (mut button, mut all) = (0i32, windows::core::BOOL(0));
+    if TaskDialogIndirect(&cfg, Some(&mut button), None, Some(&mut all)).is_err() {
+        log("win32: 冲突对话框打不开，按跳过处理");
+        return Some((Resolution::Skip, true));
+    }
+    let res = match button {
+        ID_REPLACE => Resolution::Replace,
+        ID_SKIP => Resolution::Skip,
+        ID_KEEP => Resolution::KeepBoth,
+        _ => return None,
+    };
+    Some((res, all.as_bool()))
 }
