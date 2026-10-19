@@ -5,6 +5,7 @@
 //! 工作线程发现处理不了（虚拟位置、没有可撤销的操作等），补发一次带标记的同一组合键交还系统。
 #![windows_subsystem = "windows"]
 
+mod order;
 mod shell;
 
 use std::path::PathBuf;
@@ -87,7 +88,9 @@ fn main() {
         let hinst = windows::Win32::System::LibraryLoader::GetModuleHandleW(None).unwrap();
         let wc = WNDCLASSW { lpfnWndProc: Some(wnd_proc), hInstance: hinst.into(), lpszClassName: w!("QuickCopyHook"), ..Default::default() };
         RegisterClassW(&wc);
-        let _ = CreateWindowExW(Default::default(), w!("QuickCopyHook"), w!("QuickCopyHook"), Default::default(), 0, 0, 0, 0, Some(HWND_MESSAGE), None, Some(hinst.into()), None);
+        if let Ok(h) = CreateWindowExW(Default::default(), w!("QuickCopyHook"), w!("QuickCopyHook"), Default::default(), 0, 0, 0, 0, Some(HWND_MESSAGE), None, Some(hinst.into()), None) {
+            order::register(h);
+        }
         let hook = SetWindowsHookExW(WH_KEYBOARD_LL, Some(ll_proc), Some(hinst.into()), 0).expect("安装键盘钩子失败");
         log("started");
         let mut msg = MSG::default();
@@ -101,6 +104,10 @@ fn main() {
 }
 
 unsafe extern "system" fn wnd_proc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    if msg == order::WM_SHELL_CHANGE {
+        order::on_change();
+        return LRESULT(0);
+    }
     if msg == WM_CLOSE {
         PostQuitMessage(0);
         return LRESULT(0);
@@ -208,8 +215,13 @@ fn launch(ticket: &Ticket, ui: &str) -> Result<(), String> {
         let _ = AllowSetForegroundWindow(ASFW_ANY);
     }
     match std::process::Command::new(&exe).arg(&path).spawn() {
-        Ok(c) => {
+        Ok(mut c) => {
             log(&format!("拉起 {} pid={} 用时 {}ms", exe.display(), c.id(), now_ms() - ticket.key_ms));
+            order::ui_started();
+            std::thread::spawn(move || {
+                let _ = c.wait();
+                order::ui_exited();
+            });
             Ok(())
         }
         Err(e) => {
@@ -224,6 +236,11 @@ fn handle_undo(fg: HWND, key_ms: u64, ui: &str) {
     let Some(op) = undo::last_undoable() else {
         return give_back(fg, VK_Z, "没有可撤销的操作");
     };
+    let above = order::system_ops_after(op.id);
+    if above > 0 {
+        order::handed_to_system();
+        return give_back(fg, VK_Z, &format!("我们的操作之后还有 {above} 次系统操作，先让系统撤销"));
+    }
     log(&format!("撤销 {:?} 到 {}（{} 项）", op.mode, op.dest.display(), op.items()));
     let job = Job { sources: Vec::new(), dest: op.dest.clone(), mode: op.mode };
     let ticket = Ticket { job, key_ms, undo: Some(op), clip_seq: 0 };

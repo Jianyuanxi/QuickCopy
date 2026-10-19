@@ -15,7 +15,13 @@ param(
   [string]$Dialog = '',
   # 第一个冲突对话框出现时截图存到这里
   [string]$Shot = '',
-  [int]$TimeoutS = 30
+  # 进度窗口出现 1.5 秒后截图存到这里，顺便报它是不是前台
+  [string]$ProgShot = '',
+  [int]$TimeoutS = 30,
+  # 不重启常驻进程（测 Ctrl+Z 顺序时要保留它记下的系统操作）
+  [switch]$KeepHook,
+  # 按键前先在窗口里做一次系统操作：newfolder = Ctrl+Shift+N 新建文件夹再回车
+  [string]$Pre = ''
 )
 # 端到端：常驻进程 + 真实资源管理器窗口。把文件放进剪贴板，开一个资源管理器窗口到 $Dest，
 # 模拟按 Ctrl+V，等界面进程写完日志，打印这次的日志和目标里的文件数。
@@ -77,6 +83,20 @@ $dialogQueue = [Collections.Generic.Queue[string]]::new()
 if ($Dialog) { $Dialog -split ',' | ForEach-Object { $dialogQueue.Enqueue($_.Trim()) } }
 $shotDone = $false
 # 看到冲突对话框就按队列点按钮：TDM_CLICK_VERIFICATION / TDM_CLICK_BUTTON 跨进程也能发
+$progShotDone = $false
+function Shot-Progress {
+  if (-not $ProgShot -or $script:progShotDone) { return }
+  $d = [K]::FindWindowW('QuickCopyProgress', [NullString]::Value)
+  if ($d -eq [IntPtr]::Zero -or -not [K]::IsWindowVisible($d)) { return }
+  Start-Sleep -Milliseconds 1500
+  $r = New-Object K+RECT; [K]::GetWindowRect($d, [ref]$r) | Out-Null
+  $bmp = New-Object Drawing.Bitmap ($r.R - $r.L), ($r.B - $r.T)
+  $g = [Drawing.Graphics]::FromImage($bmp); $hdc = $g.GetHdc()
+  [K]::PrintWindow($d, $hdc, 2) | Out-Null
+  $g.ReleaseHdc($hdc); $g.Dispose(); $bmp.Save($ProgShot); $bmp.Dispose()
+  $script:progShotDone = $true
+  "进度窗口截图 $ProgShot 前台=$([K]::GetForegroundWindow() -eq $d)"
+}
 function Answer-Dialog {
   $d = [K]::FindWindowW('#32770', '替换或跳过文件')
   if ($d -eq [IntPtr]::Zero -or -not [K]::IsWindowVisible($d)) { return }
@@ -103,10 +123,12 @@ function Answer-Dialog {
 $root = Resolve-Path "$PSScriptRoot\.."
 $log = Join-Path $env:LOCALAPPDATA 'QuickCopy\quickcopy.log'
 # 常驻进程按 -Ui 重启一次
-& "$root\target\release\quickcopy.exe" --quit
-Start-Sleep -Milliseconds 300
-Start-Process "$root\target\release\quickcopy.exe" -ArgumentList '--ui', $Ui
-Start-Sleep -Milliseconds 500
+if (-not $KeepHook) {
+  & "$root\target\release\quickcopy.exe" --quit
+  Start-Sleep -Milliseconds 300
+  Start-Process "$root\target\release\quickcopy.exe" -ArgumentList '--ui', $Ui
+  Start-Sleep -Milliseconds 500
+}
 
 if ($Key -eq 'V') {
   $files = New-Object System.Collections.Specialized.StringCollection
@@ -173,6 +195,10 @@ switch ($Focus) {
   'search' { [K]::Keys(0x11, 0x45) }                                               # Ctrl+E
 }
 Start-Sleep -Milliseconds 500
+if ($Pre -eq 'newfolder') {
+  [K]::Keys(0x11, 0x10, 0x4E); Start-Sleep -Milliseconds 800; [K]::Keys(0x0D); Start-Sleep -Milliseconds 800
+  "新建文件夹：$(Test-Path (Join-Path $Dest '新建文件夹'))"
+}
 $fgNow = [K]::GetForegroundWindow()
 "前台 $([K]::Cls($fgNow)) 焦点控件 $([K]::FocusClass($fgNow))"
 
@@ -183,6 +209,7 @@ $done = $false
 while (-not $done -and $sw.Elapsed.TotalSeconds -lt $TimeoutS) {
   Start-Sleep -Milliseconds 200
   Answer-Dialog
+  Shot-Progress
   $fs = [IO.File]::Open($log, 'Open', 'Read', 'ReadWrite'); $fs.Seek($mark, 'Begin') | Out-Null
   $new = (New-Object IO.StreamReader($fs, [Text.Encoding]::UTF8)).ReadToEnd(); $fs.Close()
   $done = $new -match '完成 |交还系统'
@@ -192,8 +219,11 @@ if ($Focus -ne 'list') { [K]::Keys(0x1B) }   # Esc 退出编辑
 Start-Sleep -Milliseconds 300
 $fs = [IO.File]::Open($log, 'Open', 'Read', 'ReadWrite'); $fs.Seek($mark, 'Begin') | Out-Null
 (New-Object IO.StreamReader($fs, [Text.Encoding]::UTF8)).ReadToEnd(); $fs.Close()
-$n = (Get-ChildItem -LiteralPath $Dest -Recurse -File -Force | Measure-Object).Count
-"目标文件数 $n"
+# 盘根目录（如 U 盘）不数，整盘遍历太慢
+if ([IO.Path]::GetPathRoot($Dest) -ne $Dest) {
+  $n = (Get-ChildItem -LiteralPath $Dest -Recurse -File -Force | Measure-Object).Count
+  "目标文件数 $n"
+}
 if ($Key -eq 'V' -and $Cut) {
   "剪贴板还有文件：$([System.Windows.Forms.Clipboard]::ContainsFileDropList())"
 }

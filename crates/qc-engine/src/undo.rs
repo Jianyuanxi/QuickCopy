@@ -12,9 +12,9 @@ use serde::{Deserialize, Serialize};
 use windows_sys::Win32::Foundation::{CloseHandle, WAIT_ABANDONED, WAIT_OBJECT_0};
 use windows_sys::Win32::System::Threading::{CreateMutexW, ReleaseMutex, WaitForSingleObject};
 
-use crate::exec::{restore_backup, win_err, Backup};
+use crate::exec::{remove_file_force, restore_backup, win_err, Backup};
 use crate::plan::{expand, top_item, Mode};
-use crate::win::{move_path, recycle, same_volume};
+use crate::win::{has_recycle_bin, move_path, recycle, same_volume};
 use crate::{execute, Job, Options, Progress, Report, Resolution};
 
 const KEEP: usize = 20;
@@ -160,6 +160,19 @@ fn move_back(dst: &Path, src: &Path, prog: &Progress) -> Result<(), String> {
     }
 }
 
+/// 列出 `p` 底下所有条目，先子后父，删的时候按这个顺序；不跟进链接。
+fn walk(p: &Path, out: &mut Vec<(PathBuf, bool)>) {
+    let is_dir = fs::symlink_metadata(p).is_ok_and(|m| m.is_dir());
+    if is_dir {
+        if let Ok(rd) = fs::read_dir(p) {
+            for e in rd.flatten() {
+                walk(&e.path(), out);
+            }
+        }
+    }
+    out.push((p.to_path_buf(), is_dir));
+}
+
 /// 撤销一条操作，结果按 `Report` 报（copied_files = 撤销了的条目数）。
 pub fn undo(op: &Op, prog: &Progress) -> Report {
     let t0 = Instant::now();
@@ -174,20 +187,40 @@ pub fn undo(op: &Op, prog: &Progress) -> Report {
     };
     match op.mode {
         Mode::Copy => {
-            let live: Vec<PathBuf> = op.created.iter().filter(|p| p.exists()).cloned().collect();
             for p in op.created.iter().filter(|p| !p.exists()) {
                 step(&mut r, p, Err("已经不在了".into()));
             }
-            match recycle(&live) {
-                Ok(()) => {
-                    r.copied_files += live.len() as u64;
-                    prog.done_files.fetch_add(live.len() as u64, Relaxed);
-                }
-                // 整批失败时逐个再试，能删的先删
-                Err(_) => {
-                    for p in &live {
-                        step(&mut r, p, recycle(std::slice::from_ref(p)));
+            let live: Vec<PathBuf> = op.created.iter().filter(|p| p.exists()).cloned().collect();
+            if live.first().is_some_and(|p| has_recycle_bin(p)) {
+                // 同卷送回收站只是改名，整批一次就完，进度按条目走
+                match recycle(&live) {
+                    Ok(()) => {
+                        r.copied_files += live.len() as u64;
+                        prog.done_files.fetch_add(live.len() as u64, Relaxed);
                     }
+                    // 整批失败时逐个再试，能删的先删
+                    Err(_) => {
+                        for p in &live {
+                            step(&mut r, p, recycle(std::slice::from_ref(p)));
+                        }
+                    }
+                }
+            } else {
+                // U 盘、网络盘没有回收站，系统也是彻底删除，自己删能逐个文件报进度，也快得多
+                let mut all = Vec::new();
+                for p in &live {
+                    walk(p, &mut all);
+                }
+                prog.total_files.fetch_add(all.len().saturating_sub(live.len()) as u64, Relaxed);
+                for (p, is_dir) in &all {
+                    while prog.paused.load(Relaxed) && !prog.cancel.load(Relaxed) {
+                        std::thread::sleep(std::time::Duration::from_millis(50));
+                    }
+                    if prog.cancel.load(Relaxed) {
+                        break;
+                    }
+                    let res = if *is_dir { fs::remove_dir(p) } else { remove_file_force(p) };
+                    step(&mut r, p, res.map_err(|e| e.to_string()));
                 }
             }
         }

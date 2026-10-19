@@ -334,7 +334,7 @@ fn key(p: &Path) -> String {
     p.to_string_lossy().replace('/', "\\").trim_end_matches('\\').to_lowercase()
 }
 
-fn remove_file_force(p: &Path) -> std::io::Result<()> {
+pub(crate) fn remove_file_force(p: &Path) -> std::io::Result<()> {
     match fs::remove_file(p) {
         Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
             let a = attrs(p).unwrap_or(0);

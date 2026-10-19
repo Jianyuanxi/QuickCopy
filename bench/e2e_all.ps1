@@ -9,7 +9,8 @@ $ErrorActionPreference = 'Stop'
 $base = Join-Path (Resolve-Path "$PSScriptRoot\..").Path '.tmp\e2e'
 $ops = Join-Path $env:LOCALAPPDATA 'QuickCopy\ops.json'
 $opsBackup = "$ops.e2e-backup"
-if (Test-Path $ops) { Copy-Item $ops $opsBackup -Force }
+# 用空的撤销日志跑，免得撤到用户自己的操作上
+if (Test-Path $ops) { Move-Item $ops $opsBackup -Force }
 $fails = [Collections.Generic.List[string]]::new()
 
 function Fresh($d) {

@@ -37,6 +37,19 @@ pub fn same_volume(a: &Path, b: &Path) -> bool {
     }
 }
 
+/// 所在的盘有没有回收站：只有本地固定磁盘有，U 盘、存储卡、网络盘上“送回收站”实际是彻底删除。
+pub fn has_recycle_bin(p: &Path) -> bool {
+    use windows_sys::Win32::Storage::FileSystem::GetDriveTypeW;
+    const DRIVE_FIXED: u32 = 3;
+    match volume_of(p) {
+        Some(root) => {
+            let w: Vec<u16> = root.encode_utf16().chain([0]).collect();
+            unsafe { GetDriveTypeW(w.as_ptr()) == DRIVE_FIXED }
+        }
+        None => false,
+    }
+}
+
 /// 改名/移动，目标已存在就失败，绝不覆盖。`cross` 允许跨卷（只对文件有效，系统会先复制再删）。
 pub fn move_path(src: &Path, dst: &Path, cross: bool) -> Result<(), u32> {
     let flags = if cross { MOVEFILE_COPY_ALLOWED | MOVEFILE_WRITE_THROUGH } else { 0 };

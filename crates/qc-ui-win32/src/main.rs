@@ -2,6 +2,8 @@
 //! 粘贴和撤销都走这里：扫描 → 有冲突就逐个问 → 执行，超过 300ms 才显示进度窗口。
 #![windows_subsystem = "windows"]
 
+mod look;
+
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::os::windows::fs::MetadataExt;
@@ -31,7 +33,10 @@ static SESSION: OnceLock<Arc<Session>> = OnceLock::new();
 struct Ui {
     title: HWND,
     percent: HWND,
-    bar: HWND,
+    graph: HWND,
+    curve: look::Graph,
+    /// 撤销按条目算速度：最近两秒的 (时刻, 已处理条目数)。
+    meter: std::collections::VecDeque<(std::time::Instant, u64)>,
     name: HWND,
     eta: HWND,
     detail: HWND,
@@ -76,7 +81,17 @@ fn main() {
             windows::Win32::System::Threading::THREAD_PRIORITY_HIGHEST,
         );
         let hinst: HINSTANCE = GetModuleHandleW(None).unwrap().into();
+        let icon = look::make_icon(GetSystemMetrics(SM_CXICON));
+        let small = look::make_icon(GetSystemMetrics(SM_CXSMICON));
+        let gc = WNDCLASSW {
+            lpfnWndProc: Some(graph_proc),
+            hInstance: hinst,
+            lpszClassName: w!("QuickCopyGraph"),
+            ..Default::default()
+        };
+        RegisterClassW(&gc);
         let wc = WNDCLASSW {
+            hIcon: icon,
             lpfnWndProc: Some(wnd_proc),
             hInstance: hinst,
             lpszClassName: w!("QuickCopyProgress"),
@@ -101,6 +116,8 @@ fn main() {
             None,
         )
         .unwrap();
+        SendMessageW(hwnd, WM_SETICON, Some(WPARAM(ICON_BIG as usize)), Some(LPARAM(icon.0 as isize)));
+        SendMessageW(hwnd, WM_SETICON, Some(WPARAM(ICON_SMALL as usize)), Some(LPARAM(small.0 as isize)));
         UI.with(|u| {
             let mut u = u.borrow_mut();
             u.key_ms = ticket.key_ms;
@@ -180,29 +197,28 @@ unsafe fn build(hwnd: HWND, job: &qc_engine::Job, undoing: bool) {
     u.font = font;
     u.title = child(hwnd, st, &title, SS_PATHELLIPSIS, 0);
     u.percent = child(hwnd, st, "正在计算…", 0, 0);
-    u.bar = child(hwnd, PROGRESS_CLASSW, "", 0, 0);
+    u.graph = child(hwnd, w!("QuickCopyGraph"), "", 0, 0);
     u.name = child(hwnd, st, "", SS_ENDELLIPSIS, 0);
     u.eta = child(hwnd, st, "", 0, 0);
     u.detail = child(hwnd, st, "", SS_ENDELLIPSIS, 0);
     u.pause = child(hwnd, w!("BUTTON"), "暂停", WS_TABSTOP.0, ID_PAUSE);
     u.cancel = child(hwnd, w!("BUTTON"), "取消", WS_TABSTOP.0, ID_CANCEL);
-    SendMessageW(u.bar, PBM_SETRANGE32, Some(WPARAM(0)), Some(LPARAM(1000)));
 
     let s = |v| scale(v, dpi);
     let (w, m, line) = (s(480), s(16), s(22));
-    let rows = [(u.title, s(14)), (u.percent, s(42)), (u.name, s(96)), (u.eta, s(118)), (u.detail, s(140))];
+    let rows = [(u.title, s(14)), (u.percent, s(40)), (u.name, s(158)), (u.eta, s(180)), (u.detail, s(202))];
     for (h, y) in rows {
         let _ = MoveWindow(h, m, y, w - 2 * m, line, false);
     }
-    let _ = MoveWindow(u.bar, m, s(68), w - 2 * m, s(18), false);
-    let (bw, bh, by) = (s(88), s(28), s(174));
+    let _ = MoveWindow(u.graph, m, s(66), w - 2 * m, s(84), false);
+    let (bw, bh, by) = (s(88), s(28), s(236));
     let _ = MoveWindow(u.cancel, w - m - bw, by, bw, bh, false);
     let _ = MoveWindow(u.pause, w - m - 2 * bw - s(8), by, bw, bh, false);
     for h in [u.title, u.percent, u.name, u.eta, u.detail, u.pause, u.cancel] {
         SendMessageW(h, WM_SETFONT, Some(WPARAM(font.0 as usize)), Some(LPARAM(1)));
     }
-    // 客户区 480×216 逻辑像素，换算成窗口外框大小
-    let mut rc = RECT { left: 0, top: 0, right: w, bottom: s(216) };
+    // 客户区 480×278 逻辑像素，换算成窗口外框大小
+    let mut rc = RECT { left: 0, top: 0, right: w, bottom: s(278) };
     let _ = AdjustWindowRectExForDpi(&mut rc, WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX, false, WINDOW_EX_STYLE::default(), dpi);
     let (ww, wh) = (rc.right - rc.left, rc.bottom - rc.top);
     let sx = (GetSystemMetrics(SM_CXSCREEN) - ww) / 2;
@@ -244,7 +260,7 @@ unsafe fn tick(hwnd: HWND) {
         if !u.shown && since >= SHOW_DELAY {
             u.shown = true;
             let _ = ShowWindow(hwnd, SW_SHOWNORMAL);
-            let _ = SetForegroundWindow(hwnd);
+            look::bring_to_front(hwnd);
             u.foreground = GetForegroundWindow() == hwnd;
             // 复制时磁盘很忙，写日志可能卡上一秒，所以只记时间，结束时一起写
             u.shown_ms = now_ms();
@@ -252,31 +268,57 @@ unsafe fn tick(hwnd: HWND) {
         if !u.shown {
             return;
         }
-        if snap.total_bytes > 0 && snap.phase == Phase::Copying {
+        if snap.phase != Phase::Copying {
+            return;
+        }
+        let undoing = session.undo.is_some();
+        let paused = if snap.paused { "（已暂停）" } else { "" };
+        // 复制按字节算进度，撤销按条目算
+        let (frac, speed, label, eta) = if undoing {
+            let now = std::time::Instant::now();
+            u.meter.push_back((now, snap.done_files));
+            while u.meter.len() > 2 && now.duration_since(u.meter[0].0) > Duration::from_secs(2) {
+                u.meter.pop_front();
+            }
+            let (t0, n0) = u.meter[0];
+            let dt = now.duration_since(t0).as_secs_f64();
+            let rate = if dt > 0.2 { (snap.done_files - n0.min(snap.done_files)) as f64 / dt } else { 0.0 };
+            let frac = if snap.total_files > 0 { snap.done_files as f64 / snap.total_files as f64 } else { 0.0 };
+            let left = snap.total_files.saturating_sub(snap.done_files) as f64;
+            let eta = (rate > 0.0).then(|| Duration::from_secs_f64(left / rate));
+            (frac, rate, format!("速度：{rate:.0} 个项目/秒"), eta)
+        } else if snap.total_bytes > 0 {
             let frac = snap.done_bytes as f64 / snap.total_bytes as f64;
-            // 主题进度条往前走有动画会落后于真实进度，往回设是立即生效的，所以先多设 1 再退回
-            let pos = (frac * 1000.0) as usize;
-            SendMessageW(u.bar, PBM_SETPOS, Some(WPARAM((pos + 1).min(1000))), None);
-            SendMessageW(u.bar, PBM_SETPOS, Some(WPARAM(pos)), None);
-            let state = if snap.paused { PBST_PAUSED } else { 1 }; // PBST_NORMAL
-            SendMessageW(u.bar, PBM_SETSTATE, Some(WPARAM(state as usize)), None);
-            set_text(u.percent, &format!("已完成 {:.0}%{}", frac * 100.0, if snap.paused { "（已暂停）" } else { "" }));
-            set_text(u.name, &format!("名称：{}", snap.current.as_deref().unwrap_or("")));
-            let eta = match (snap.paused, snap.eta) {
-                (true, _) => "剩余时间：已暂停".to_string(),
-                (false, Some(d)) => format!("剩余时间：{}", fmt_eta(d)),
-                (false, None) => "剩余时间：正在计算…".to_string(),
-            };
-            set_text(u.eta, &eta);
+            (frac, snap.bytes_per_sec, format!("速度：{}/秒", fmt_bytes(snap.bytes_per_sec)), snap.eta)
+        } else {
+            return;
+        };
+        if !snap.paused {
+            u.curve.push(frac as f32, speed as f32, label);
+        }
+        let _ = InvalidateRect(Some(u.graph), None, false);
+        set_text(u.percent, &format!("已完成 {:.0}%{paused}", frac * 100.0));
+        let name = if undoing {
+            format!("已处理 {} / {} 项", snap.done_files, snap.total_files)
+        } else {
+            format!("名称：{}", snap.current.as_deref().unwrap_or(""))
+        };
+        set_text(u.name, &name);
+        let eta = match (snap.paused, eta) {
+            (true, _) => "剩余时间：已暂停".to_string(),
+            (false, Some(d)) => format!("剩余时间：{}", fmt_eta(d)),
+            (false, None) => "剩余时间：正在计算…".to_string(),
+        };
+        set_text(u.eta, &eta);
+        if !undoing {
             set_text(
                 u.detail,
                 &format!(
-                    "{} / {} · {} / {} 个文件 · {}/s",
+                    "{} / {} · {} / {} 个文件",
                     fmt_bytes(snap.done_bytes as f64),
                     fmt_bytes(snap.total_bytes as f64),
                     snap.done_files,
                     snap.total_files,
-                    fmt_bytes(snap.bytes_per_sec)
                 ),
             );
         }
@@ -321,6 +363,27 @@ unsafe fn finish(hwnd: HWND) {
         MessageBoxW(None, &HSTRING::from(lines.join("\n\n")), w!("QuickCopy"), MB_ICONWARNING | MB_SETFOREGROUND);
     }
     let _ = DestroyWindow(hwnd);
+}
+
+unsafe extern "system" fn graph_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    match msg {
+        WM_PAINT => {
+            let mut ps = PAINTSTRUCT::default();
+            let hdc = BeginPaint(hwnd, &mut ps);
+            let mut rc = RECT::default();
+            let _ = GetClientRect(hwnd, &mut rc);
+            UI.with(|u| {
+                // 借不到（正在别处改）就等下次重画
+                if let Ok(u) = u.try_borrow() {
+                    look::paint_graph(hdc, rc, &u.curve, u.font);
+                }
+            });
+            let _ = EndPaint(hwnd, &ps);
+            LRESULT(0)
+        }
+        WM_ERASEBKGND => LRESULT(1),
+        _ => DefWindowProcW(hwnd, msg, wp, lp),
+    }
 }
 
 unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
@@ -409,7 +472,7 @@ const ID_KEEP: i32 = 1003;
 
 unsafe extern "system" fn dialog_proc(h: HWND, msg: TASKDIALOG_NOTIFICATIONS, _: WPARAM, _: LPARAM, _: isize) -> windows::core::HRESULT {
     if msg == TDN_CREATED {
-        let _ = SetForegroundWindow(h);
+        look::bring_to_front(h);
     }
     windows::core::HRESULT(0)
 }
