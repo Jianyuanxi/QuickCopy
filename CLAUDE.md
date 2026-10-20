@@ -33,7 +33,7 @@
   - 它的触发方式：一个只接收消息的窗口注册全局热键，配合 SetWinEventHook 判断前台是不是 CabinetWClass 窗口或桌面，再从剪贴板的 CF_HDROP 读出文件列表。它用的是 Ctrl+Shift+V，我们要接管 Ctrl+V 本身。
   - 它的引擎：大文件用 CopyFileExW 加 NO_BUFFERING，按盘的类型自动调线程数。
 - 剪切和复制的区分：读剪贴板的 `Preferred DropEffect`。
-- 界面：进度窗口和冲突对话框要像系统原生的。**已定用 Win32**（crates/qc-ui-win32，2026-10-19 用户拍板）。两版实测：Win32 私有内存约 16 MB、复制满载时按键后约 0.5 s 出窗口；Tauri 连 WebView2 共 7 个进程、约 235 MB，要 1.7–3.3 s，复制速度一样，没有优势。crates/qc-ui-tauri 只留作对照，已排除出 workspace，不再维护。
+- 界面：进度窗口和冲突对话框要像系统原生的。**已定用 Win32**（crates/qc-ui-win32，2026-10-19 用户拍板）。两版实测：Win32 私有内存约 16 MB、复制满载时按键后约 0.5 s 出窗口；Tauri 连 WebView2 共 7 个进程、约 235 MB，要 1.7–3.3 s，复制速度一样，没有优势。Tauri 对照版已于 2026-10-20 删除，不要加回来。
 
 ## 已实现的做法与测试（阶段 1）
 
@@ -61,11 +61,12 @@
 2026-10-19 Defender 下重测（bench/bench.ps1，C 盘拷到 E 盘）：小文件 robocopy 4.36–4.59 s / qc 3.50–3.80 s；Onto-Contract robocopy 1.88–2.16 s / qc 1.60–1.67 s；4 GB robocopy 1.72–1.86 s / qc 1.29–1.44 s。三项都达标。
 
 验收线：自研引擎在上面三个场景里都不能比 robocopy /MT:64 慢；资源管理器是要甩开的对象。
-测试数据生成脚本和测速脚本的思路：生成 2 万个 4–64 KB 的随机文件，加一个 4 GB 文件；每次拷到新目录，核对文件数和总字节数；大文件拷完要 Flush 落盘再停表，否则测到的只是内存缓存。
+测试数据用 `pwsh -File bench/gen.ps1` 生成（2 万个 4–64 KB 随机文件加一个 4 GB 文件，默认放 `.bench\data\bench`，`QC_BENCH_DATA` 可改）；测速时每次拷到新目录，核对文件数和总字节数；大文件拷完要 Flush 落盘再停表，否则测到的只是内存缓存。
 
 ## 本机环境的坑
 
 - 杀毒软件：卡巴斯基已于 2026-10-19 卸载，现在是 Windows Defender。上面的基准是在卡巴斯基实时扫描下测的，验收前要在 Defender 下把 robocopy /MT:64 基线重测一遍，以重测结果为准。Defender 的实时扫描同样会拖慢小文件复制；要不要给测试目录加排除（需管理员，由用户操作）到时再定。
 - Windows 11：经典注册表方式加的右键菜单项会藏在“显示更多选项”里面。
+- **开机自启用启动文件夹快捷方式 `QuickCopy.lnk`（`crates/quickcopy/src/autostart.rs`），不要改回 HKCU `Run`**：本机登录时 Explorer 静默跳过新写入的 Run 项（Shell-Core 日志 9707 里没有它，`StartupApproved` 写成 02 也没用，2026-10-20 三次开机都没起来），快捷方式能正常启动（QuickView 同样做法已重启验证）。`--install [--ui win32]` / `--uninstall` 建删快捷方式；常驻进程启动时把旧的 `Run\QuickCopy` 及其 `StartupApproved\Run` 记录删掉，旧版开过自启且快捷方式不存在时补建，不覆盖用户在“设置 > 启动应用”里的开关。查自启看 `quickcopy.log` 开机后有没有 `started`。
 - 构建用 E:\Rust 下的 cargo。临时文件放项目内被 .gitignore 忽略的目录，不放 /tmp。
 - 在 E 盘或 E:\_claude_bench 这类盘根目录下删文件夹会被保护检查拦下；遇到就把命令给用户，让用户自己删。

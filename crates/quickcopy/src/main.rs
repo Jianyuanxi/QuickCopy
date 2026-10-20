@@ -5,6 +5,7 @@
 //! 工作线程发现处理不了（虚拟位置、没有可撤销的操作等），补发一次带标记的同一组合键交还系统。
 #![windows_subsystem = "windows"]
 
+mod autostart;
 mod order;
 mod shell;
 
@@ -42,7 +43,7 @@ fn main() {
     if args.iter().any(|a| a == "--install" || a == "--uninstall") {
         let on = args.iter().any(|a| a == "--install");
         let ui = args.iter().position(|a| a == "--ui").and_then(|i| args.get(i + 1)).map(String::as_str);
-        if let Err(e) = autostart(on, ui) {
+        if let Err(e) = autostart::set(on, ui) {
             log(&format!("设置开机启动失败：{e}"));
             std::process::exit(1);
         }
@@ -62,6 +63,7 @@ fn main() {
             return; // 已经在运行
         }
     }
+    autostart::migrate();
     let ui = args
         .iter()
         .position(|a| a == "--ui")
@@ -273,23 +275,5 @@ fn handle_paste(fg: HWND, defview: HWND, key_ms: u64, ui: &str) {
     let ticket = Ticket { job: Job { sources: clip.files, dest, mode }, key_ms, undo: None, clip_seq };
     if let Err(e) = launch(&ticket, ui) {
         give_back(fg, VK_V, &e);
-    }
-}
-
-/// 开机启动：写或删 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run\QuickCopy`，不需要管理员权限。
-fn autostart(on: bool, ui: Option<&str>) -> windows::core::Result<()> {
-    use windows::Win32::System::Registry::{RegDeleteKeyValueW, RegSetKeyValueW, HKEY_CURRENT_USER, REG_SZ};
-    let key = w!("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
-    unsafe {
-        if !on {
-            return RegDeleteKeyValueW(HKEY_CURRENT_USER, key, w!("QuickCopy")).ok();
-        }
-        let exe = std::env::current_exe().map_err(|e| windows::core::Error::new(windows::core::HRESULT(-1), e.to_string()))?;
-        let cmd = match ui {
-            Some(ui) => format!("\"{}\" --ui {ui}", exe.display()),
-            None => format!("\"{}\"", exe.display()),
-        };
-        let data: Vec<u16> = cmd.encode_utf16().chain([0]).collect();
-        RegSetKeyValueW(HKEY_CURRENT_USER, key, w!("QuickCopy"), REG_SZ.0, Some(data.as_ptr() as _), (data.len() * 2) as u32).ok()
     }
 }

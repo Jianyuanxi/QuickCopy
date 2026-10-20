@@ -1,4 +1,3 @@
 /target
 /.bench
 /.tmp
-/crates/qc-ui-tauri/gen

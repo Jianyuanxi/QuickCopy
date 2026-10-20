@@ -69,7 +69,7 @@ pub fn peak_memory() -> String {
     format!("工作集峰值 {:.1} MB / 私有 {:.1} MB", mb(c.PeakWorkingSetSize), mb(c.PrivateUsage))
 }
 
-/// 本进程加上全部子孙进程（Tauri 版的 WebView2 进程都挂在下面）的内存合计。
+/// 本进程加上全部子孙进程的内存合计。
 pub fn tree_memory() -> String {
     use std::collections::HashSet;
     use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
