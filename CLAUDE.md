@@ -34,6 +34,7 @@
   - 它的引擎：大文件用 CopyFileExW 加 NO_BUFFERING，按盘的类型自动调线程数。
 - 剪切和复制的区分：读剪贴板的 `Preferred DropEffect`。
 - 界面：进度窗口和冲突对话框要像系统原生的。**已定用 Win32**（crates/qc-ui-win32，2026-10-19 用户拍板）。两版实测：Win32 私有内存约 16 MB、复制满载时按键后约 0.5 s 出窗口；Tauri 连 WebView2 共 7 个进程、约 235 MB，要 1.7–3.3 s，复制速度一样，没有优势。Tauri 对照版已于 2026-10-20 删除，不要加回来。
+- 图标用 `assets/app.svg`（一张浅灰纸 + 灰蓝闪电，用户 2026-10-20 选的方案 B），`assets/app.ico` 由它渲染出 16–256 九个尺寸；两个 exe 的 build.rs 用 embed-resource 嵌成资源 1，进度窗口的标题栏图标也 `LoadImageW` 取它。
 
 ## 已实现的做法与测试（阶段 1）
 

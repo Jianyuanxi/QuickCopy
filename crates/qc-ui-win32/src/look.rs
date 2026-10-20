@@ -1,6 +1,5 @@
 //! 外观：速度曲线（仿系统复制窗口的绿色图）、窗口图标、打开时切到前台。
 
-use windows::core::BOOL;
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
@@ -122,74 +121,12 @@ pub unsafe fn paint_graph(hdc: HDC, rc: RECT, g: &Graph, font: HFONT) {
     let _ = DeleteDC(mem);
 }
 
-/// 窗口图标：绿底圆角方块上两张叠着的白纸，用代码画，不用资源文件。
+/// 窗口图标：exe 里嵌的资源 1（assets/app.ico），按要的尺寸取最接近的一张。
 pub unsafe fn make_icon(size: i32) -> HICON {
-    let n = size as usize;
-    let mut px = vec![0u32; n * n];
-    // 圆角矩形内外判断（单位坐标）
-    let in_rr = |x: f32, y: f32, l: f32, t: f32, r: f32, b: f32, rad: f32| {
-        if x < l || x > r || y < t || y > b {
-            return false;
-        }
-        let cx = x.clamp(l + rad, r - rad);
-        let cy = y.clamp(t + rad, b - rad);
-        (x - cx).powi(2) + (y - cy).powi(2) <= rad * rad
-    };
-    const SS: usize = 4;
-    for py in 0..n {
-        for pxi in 0..n {
-            let (mut a, mut rr, mut gg, mut bb) = (0f32, 0f32, 0f32, 0f32);
-            for sy in 0..SS {
-                for sx in 0..SS {
-                    let x = (pxi as f32 + (sx as f32 + 0.5) / SS as f32) / n as f32;
-                    let y = (py as f32 + (sy as f32 + 0.5) / SS as f32) / n as f32;
-                    let mut c: Option<(f32, f32, f32)> = None;
-                    if in_rr(x, y, 0.03, 0.03, 0.97, 0.97, 0.2) {
-                        c = Some((22.0, 163.0, 74.0));
-                    }
-                    if in_rr(x, y, 0.2, 0.17, 0.6, 0.68, 0.05) {
-                        c = Some((150.0, 220.0, 170.0));
-                    }
-                    if in_rr(x, y, 0.38, 0.32, 0.8, 0.84, 0.05) {
-                        c = Some((255.0, 255.0, 255.0));
-                    }
-                    if let Some((r, g, b)) = c {
-                        a += 1.0;
-                        rr += r;
-                        gg += g;
-                        bb += b;
-                    }
-                }
-            }
-            if a > 0.0 {
-                let alpha = (a / (SS * SS) as f32 * 255.0) as u32;
-                let (r, g, b) = ((rr / a) as u32, (gg / a) as u32, (bb / a) as u32);
-                px[py * n + pxi] = alpha << 24 | r << 16 | g << 8 | b;
-            }
-        }
-    }
-    let bi = BITMAPINFO {
-        bmiHeader: BITMAPINFOHEADER {
-            biSize: size_of::<BITMAPINFOHEADER>() as u32,
-            biWidth: size,
-            biHeight: -size,
-            biPlanes: 1,
-            biBitCount: 32,
-            biCompression: BI_RGB.0,
-            ..Default::default()
-        },
-        ..Default::default()
-    };
-    let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
-    let Ok(color) = CreateDIBSection(None, &bi, DIB_RGB_COLORS, &mut bits, None, 0) else { return HICON::default() };
-    std::ptr::copy_nonoverlapping(px.as_ptr(), bits as *mut u32, n * n);
-    let mask_bits = vec![0u8; n.div_ceil(16) * 2 * n];
-    let mask = CreateBitmap(size, size, 1, 1, Some(mask_bits.as_ptr() as _));
-    let info = ICONINFO { fIcon: BOOL(1), xHotspot: 0, yHotspot: 0, hbmMask: mask, hbmColor: color };
-    let icon = CreateIconIndirect(&info).unwrap_or_default();
-    let _ = DeleteObject(color.into());
-    let _ = DeleteObject(mask.into());
-    icon
+    let hinst = windows::Win32::System::LibraryLoader::GetModuleHandleW(None).ok().map(|h| HINSTANCE(h.0));
+    LoadImageW(hinst, windows::core::PCWSTR(1 as _), IMAGE_ICON, size, size, LR_DEFAULTCOLOR)
+        .map(|h| HICON(h.0))
+        .unwrap_or_default()
 }
 
 /// 打开时切到最前面并拿到焦点。界面进程是常驻进程拉起来的，系统默认不让它抢前台，
