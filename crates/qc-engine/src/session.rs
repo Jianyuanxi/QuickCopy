@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use crate::undo::{self, Op};
-use crate::{execute, prepare, DepDir, FileItem, Job, Mode, Options, Plan, Progress, Report, Resolution, DEP_ASK_MIN_FILES};
+use crate::{execute, prepare, DepDir, DepSkip, FileItem, Job, Mode, Options, Plan, Progress, Report, Resolution, DEP_ASK_MIN_FILES};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Phase {
@@ -38,7 +38,7 @@ pub struct Session {
     pub deps: OnceLock<Vec<DepDir>>,
     phase: AtomicU8,
     decide_tx: SyncSender<Decision>,
-    deps_tx: SyncSender<bool>,
+    deps_tx: SyncSender<DepSkip>,
     meter: Mutex<VecDeque<(Instant, u64)>>,
     pub started: Instant,
 }
@@ -89,7 +89,7 @@ impl Session {
         s
     }
 
-    fn run(&self, rx: Receiver<Decision>, deps_rx: Receiver<bool>) {
+    fn run(&self, rx: Receiver<Decision>, deps_rx: Receiver<DepSkip>) {
         if let Some(op) = &self.undo {
             self.phase.store(Phase::Copying as u8, Relaxed);
             let _ = self.report.set(undo::undo(op, &self.prog));
@@ -110,9 +110,7 @@ impl Session {
             if deps.iter().map(|d| d.files).sum::<usize>() >= DEP_ASK_MIN_FILES {
                 let _ = self.deps.set(deps);
                 self.phase.store(Phase::AskDeps as u8, Relaxed);
-                if deps_rx.recv().unwrap_or(false) {
-                    p.drop_deps();
-                }
+                p.drop_deps(deps_rx.recv().unwrap_or(DepSkip::None));
                 if self.prog.cancel.load(Relaxed) {
                     self.phase.store(Phase::Done as u8, Relaxed);
                     return;
@@ -148,8 +146,8 @@ impl Session {
         let _ = self.decide_tx.try_send(d);
     }
 
-    /// 回答依赖目录的询问：true 跳过它们。
-    pub fn skip_deps(&self, skip: bool) {
+    /// 回答依赖目录的询问。
+    pub fn skip_deps(&self, skip: DepSkip) {
         let _ = self.deps_tx.try_send(skip);
     }
 
@@ -173,7 +171,7 @@ impl Session {
     pub fn cancel(&self) {
         self.prog.cancel.store(true, Relaxed);
         self.prog.paused.store(false, Relaxed);
-        self.skip_deps(false);
+        self.skip_deps(DepSkip::None);
         self.decide(Decision { default: Resolution::Skip, per_file: Default::default() });
     }
 

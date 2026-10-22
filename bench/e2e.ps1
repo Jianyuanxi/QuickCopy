@@ -12,7 +12,7 @@ param(
   # V 粘贴 / Z 撤销（撤销不碰剪贴板）
   [ValidateSet('V', 'Z')] [string]$Key = 'V',
   # 冲突对话框依次怎么点，逗号隔开：replace / skip / keep / cancel，后面加 ! 表示勾上“对剩下的都这样”；
-  # 依赖目录对话框：skipdeps / copyall / cancel
+  # 依赖目录对话框：skipdeps（保留 .git）/ skipall / copyall / cancel
   [string]$Dialog = '',
   # 第一个冲突对话框出现时截图存到这里
   [string]$Shot = '',
@@ -115,7 +115,7 @@ function Answer-Dialog {
   if ($dialogQueue.Count -eq 0) { "对话框出现但没有安排怎么点"; return }
   $a = $dialogQueue.Dequeue()
   $all = $a.EndsWith('!'); $a = $a.TrimEnd('!')
-  $id = @{ replace = 1001; skip = 1002; keep = 1003; skipdeps = 1011; copyall = 1012; cancel = 2 }[$a]
+  $id = @{ replace = 1001; skip = 1002; keep = 1003; skipdeps = 1011; copyall = 1012; skipall = 1013; cancel = 2 }[$a]
   if ($all) { [K]::SendMessageW($d, 0x471, [IntPtr]1, [IntPtr]0) | Out-Null }
   [K]::SendMessageW($d, 0x466, [IntPtr]$id, [IntPtr]0) | Out-Null
   "对话框：点 $a$(if ($all) { '（对剩下的都这样）' })"

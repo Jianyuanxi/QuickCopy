@@ -46,7 +46,7 @@
 - 引擎测试：`python bench/engine_test.py <E 盘目录> <C 盘目录>`（撤销日志写到隔离目录）。
 - 端到端测试（真实资源管理器，会开关窗口）：`pwsh -STA -File bench/e2e_all.ps1`。它把 `LOCALAPPDATA` 指到 `.tmp\e2e-appdata` 跑，跑完用 WMI 在包外换回安装版常驻进程。**不要改回“把 ops.json 挪开”的做法**：在 Claude 桌面版（MSIX）里挪走的只是包内副本，读会落到用户真实的撤销日志，2026-10-22 因此撤到过用户的操作（目标已不存在，没删到东西）。单独跑 `e2e.ps1` 测 Ctrl+Z 时同样先设 `$env:LOCALAPPDATA`。
 - 正在用的程序装在 `%LOCALAPPDATA%\QuickCopy\bin`（`quickcopy.exe --install` 复制过去并改自启快捷方式），`target\release` 只是开发版，构建不再被常驻进程锁住。改完要给用户生效：**用 WMI 在包外跑** `target\release\quickcopy.exe --install`（`Invoke-CimMethod Win32_Process Create`）；在 Claude 的 shell 里直接跑，文件和快捷方式会写进 MSIX 包内副本，用户那边看不到。从 Claude 里读 `%LOCALAPPDATA%\QuickCopy\quickcopy.log` 读到的可能是包内旧副本，看真实日志同样走包外进程。
-- 跳过依赖目录：`plan.rs` 的 `DEP_DIRS`、`DEP_ASK_MIN_FILES`（300），只在复制时问（跨盘移动跳过会让源删不干净）。
+- 跳过依赖目录：`plan.rs` 的 `DEP_DIRS`、`DEP_ASK_MIN_FILES`（300），只在复制时问（跨盘移动跳过会让源删不干净）。对话框三个选项（用户 2026-10-22 要求，每类目录配大白话说明）：跳过依赖保留 .git（默认）、连 .git 全跳过、全部复制；只有 .git 时默认全部复制。
 - 测速：`pwsh -File bench/bench.ps1 -Cases small`，每次只传一个 case（`-File` 传不了数组）。
 
 ## 实测基准（2026-10-18，本机 C 盘拷到 E 盘，E 盘是 WD SN5000）

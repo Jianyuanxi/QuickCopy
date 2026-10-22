@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use qc_engine::session::{fmt_bytes, fmt_eta, Decision, Phase, Session};
 use qc_engine::ticket::{log, now_ms, take_ticket};
-use qc_engine::{numbered_name, FileItem, Mode, Resolution};
+use qc_engine::{numbered_name, DepSkip, FileItem, Mode, Resolution};
 use windows::core::{w, HSTRING, PCWSTR};
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Gdi::*;
@@ -478,27 +478,59 @@ const ID_SKIP: i32 = 1002;
 const ID_KEEP: i32 = 1003;
 const ID_SKIP_DEPS: i32 = 1011;
 const ID_COPY_ALL: i32 = 1012;
+const ID_SKIP_ALL: i32 = 1013;
 
-/// 问要不要跳过 node_modules 这类目录。返回 Some(true) 跳过，None 表示取消整个操作。
-unsafe fn ask_deps(owner: HWND, session: &Session) -> Option<bool> {
+/// 问要不要跳过 node_modules 这类目录。None 表示取消整个操作。
+unsafe fn ask_deps(owner: HWND, session: &Session) -> Option<DepSkip> {
     let deps = session.deps.get()?;
-    let (files, bytes) = deps.iter().fold((0, 0), |(f, b), d| (f + d.files, b + d.bytes));
+    let kind = |d: &qc_engine::DepDir| d.rel.file_name().map(|n| n.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
+    let sum = |f: &dyn Fn(&str) -> bool| deps.iter().filter(|d| f(&kind(d))).fold((0, 0), |(n, b), d| (n + d.files, b + d.bytes));
+    let (regen_files, regen_bytes) = sum(&|k| k != ".git");
+    let (all_files, all_bytes) = sum(&|_| true);
+    let has_git = regen_files < all_files;
+    let has_regen = regen_files > 0;
+    let has_lib = deps.iter().any(|d| matches!(kind(d).as_str(), "node_modules" | ".venv" | "venv"));
+    let has_cache = deps.iter().any(|d| kind(d) == "__pycache__");
+
     let mut list: Vec<String> = deps.iter().take(6).map(|d| format!("{}　{} 个文件，{}", d.rel.display(), d.files, fmt_bytes(d.bytes as f64))).collect();
     if deps.len() > 6 {
         list.push(format!("…另外 {} 个", deps.len() - 6));
     }
-    let has_git = deps.iter().any(|d| d.rel.file_name().is_some_and(|n| n.eq_ignore_ascii_case(".git")));
-    let note = if has_git { "\n\n.git 是版本历史，跳过后目标里没有提交记录。" } else { "" };
+    // 大白话说明每类目录是什么、跳过会怎样
+    let mut notes = Vec::new();
+    if has_lib {
+        notes.push("node_modules、venv：项目用到的第三方代码包。跳过后，在新位置运行一次 npm install 或 pip install 就会自动装回来（要联网，一般几十秒到几分钟），装好之前项目跑不起来。");
+    }
+    if has_cache {
+        notes.push("__pycache__：Python 自动生成的缓存。跳过没有任何影响，下次运行时会自己重新生成。");
+    }
+    if has_git {
+        notes.push(".git：版本历史，记着以前每一次修改。跳过后新位置只有现在这一份文件，看不到也退不回旧版本（原文件夹里的历史还在）。");
+    }
 
     let title = HSTRING::from("复制文件夹");
     let main = HSTRING::from("要复制的文件夹里有依赖和缓存目录");
-    let content = HSTRING::from(format!("{}{note}", list.join("\n")));
-    let b_skip = HSTRING::from(format!("跳过这些目录\n少复制 {files} 个文件、{}，依赖之后可以重新安装", fmt_bytes(bytes as f64)));
-    let b_all = HSTRING::from("全部复制\n包括这些目录");
-    let buttons = [
-        TASKDIALOG_BUTTON { nButtonID: ID_SKIP_DEPS, pszButtonText: PCWSTR(b_skip.as_ptr()) },
-        TASKDIALOG_BUTTON { nButtonID: ID_COPY_ALL, pszButtonText: PCWSTR(b_all.as_ptr()) },
-    ];
+    let content = HSTRING::from(format!("{}\n\n{}", list.join("\n"), notes.join("\n\n")));
+    let size = |n: usize, b: u64| format!("少复制 {n} 个文件、{}", fmt_bytes(b as f64));
+    let b_keep = HSTRING::from(if has_git {
+        format!("跳过依赖和缓存，保留 .git\n{}。版本历史照常带过去，到新位置重新装一次依赖就能用", size(regen_files, regen_bytes))
+    } else {
+        format!("跳过这些目录\n{}。到新位置重新装一次依赖就能用", size(regen_files, regen_bytes))
+    });
+    let b_skip_all = HSTRING::from(if has_regen {
+        format!("全部跳过，连 .git 也不要\n{}。最快，但新位置没有版本历史", size(all_files, all_bytes))
+    } else {
+        format!("跳过 .git\n{}。新位置没有版本历史，只有现在这一份文件", size(all_files, all_bytes))
+    });
+    let b_all = HSTRING::from("全部复制\n最慢，但拷过去直接就能用，什么都不用重装");
+    let mut buttons = Vec::new();
+    if has_regen {
+        buttons.push(TASKDIALOG_BUTTON { nButtonID: ID_SKIP_DEPS, pszButtonText: PCWSTR(b_keep.as_ptr()) });
+    }
+    if has_git {
+        buttons.push(TASKDIALOG_BUTTON { nButtonID: ID_SKIP_ALL, pszButtonText: PCWSTR(b_skip_all.as_ptr()) });
+    }
+    buttons.push(TASKDIALOG_BUTTON { nButtonID: ID_COPY_ALL, pszButtonText: PCWSTR(b_all.as_ptr()) });
     let cfg = TASKDIALOGCONFIG {
         cbSize: size_of::<TASKDIALOGCONFIG>() as u32,
         hwndParent: if IsWindowVisible(owner).as_bool() { owner } else { HWND::default() },
@@ -509,18 +541,20 @@ unsafe fn ask_deps(owner: HWND, session: &Session) -> Option<bool> {
         pszContent: PCWSTR(content.as_ptr()),
         cButtons: buttons.len() as u32,
         pButtons: buttons.as_ptr(),
-        nDefaultButton: ID_SKIP_DEPS,
+        // 只有 .git 时默认全部复制：版本历史丢了找不回来
+        nDefaultButton: if has_regen { ID_SKIP_DEPS } else { ID_COPY_ALL },
         pfCallback: Some(dialog_proc),
         ..Default::default()
     };
     let mut button = 0i32;
     if TaskDialogIndirect(&cfg, Some(&mut button), None, None).is_err() {
         log("win32: 依赖目录对话框打不开，按全部复制处理");
-        return Some(false);
+        return Some(DepSkip::None);
     }
     match button {
-        ID_SKIP_DEPS => Some(true),
-        ID_COPY_ALL => Some(false),
+        ID_SKIP_DEPS => Some(DepSkip::KeepGit),
+        ID_SKIP_ALL => Some(DepSkip::All),
+        ID_COPY_ALL => Some(DepSkip::None),
         _ => None,
     }
 }

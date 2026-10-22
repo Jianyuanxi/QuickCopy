@@ -95,17 +95,21 @@ Check '跨盘剪切后 Ctrl+Z：移回原处' ((Tree $xs) -eq $srcBefore -and (T
 $out = E2E -Key Z -Dest $xd
 Check '没有可撤销的：Ctrl+Z 交给系统' (($out -join "`n") -match '交还系统：没有可撤销的操作') ($out -join ' / ')
 
-# 7. 依赖目录：项目里有 node_modules（300 个文件）和 __pycache__，点跳过只拷源码；点全部复制都拷
+# 7. 依赖目录：项目里有 node_modules（300 个文件）、__pycache__ 和 .git。
+#    跳过依赖保留 .git；全部跳过只剩源码；全部复制都拷
 $ps = "$base\p-src\proj"
-Put "$ps\main.py" 'm'; Put "$ps\src\a.js" 'a'; Put "$ps\__pycache__\main.pyc" 'c'
+Put "$ps\main.py" 'm'; Put "$ps\src\a.js" 'a'; Put "$ps\__pycache__\main.pyc" 'c'; Put "$ps\.git\HEAD" 'h'
 1..300 | ForEach-Object { Put "$ps\node_modules\pkg$($_ % 10)\f$_.js" 'x' }
 $pd = "$base\p-dst1"; New-Item -ItemType Directory $pd -Force | Out-Null
 E2E -Src $ps -Dest $pd -Dialog 'skipdeps'
-Check '依赖目录：跳过' ((Tree $pd) -eq 'proj=<dir>; proj\main.py=m; proj\src=<dir>; proj\src\a.js=a') (Tree $pd)
+Check '依赖目录：跳过依赖、保留 .git' ((Tree $pd) -eq 'proj=<dir>; proj\.git=<dir>; proj\.git\HEAD=h; proj\main.py=m; proj\src=<dir>; proj\src\a.js=a') (Tree $pd)
+$pd = "$base\p-dst3"; New-Item -ItemType Directory $pd -Force | Out-Null
+E2E -Src $ps -Dest $pd -Dialog 'skipall'
+Check '依赖目录：全部跳过' ((Tree $pd) -eq 'proj=<dir>; proj\main.py=m; proj\src=<dir>; proj\src\a.js=a') (Tree $pd)
 $pd = "$base\p-dst2"; New-Item -ItemType Directory $pd -Force | Out-Null
 E2E -Src $ps -Dest $pd -Dialog 'copyall'
-$n = (Get-ChildItem $pd -Recurse -File).Count
-Check '依赖目录：全部复制' ($n -eq 303) "文件数 $n，期望 303"
+$n = (Get-ChildItem $pd -Recurse -File -Force).Count
+Check '依赖目录：全部复制' ($n -eq 304) "文件数 $n，期望 304"
 
 } finally {
   # 换回安装版常驻进程（e2e.ps1 启动的是 target 里的开发版）。

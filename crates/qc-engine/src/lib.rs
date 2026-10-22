@@ -11,7 +11,7 @@ pub mod undo;
 mod win;
 
 pub use exec::{execute, Backup, Options, Progress, Report, Resolution};
-pub use plan::{copy_name, expand, numbered_name, plan, prepare, rename_plan, same_path, top_item, DepDir, FileItem, Job, Mode, Plan, TopItem, DEP_ASK_MIN_FILES, DEP_DIRS};
+pub use plan::{copy_name, expand, numbered_name, plan, prepare, rename_plan, same_path, top_item, DepDir, DepSkip, FileItem, Job, Mode, Plan, TopItem, DEP_ASK_MIN_FILES, DEP_DIRS};
 pub use win::same_volume;
 
 /// 达到这个大小的文件走无缓冲复制，并按块汇报进度。

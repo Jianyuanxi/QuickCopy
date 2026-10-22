@@ -68,9 +68,20 @@ pub const DEP_DIRS: [&str; 5] = ["node_modules", ".venv", "venv", "__pycache__",
 /// 依赖目录里的文件加起来少于这么多就不问：跳过省不了几秒，弹窗反而打断。
 pub const DEP_ASK_MIN_FILES: usize = 300;
 
-fn is_dep(name: &std::ffi::OsStr) -> bool {
+fn is_dep(name: &std::ffi::OsStr, git: bool) -> bool {
     let n = name.to_string_lossy();
-    DEP_DIRS.iter().any(|d| n.eq_ignore_ascii_case(d))
+    DEP_DIRS.iter().any(|d| n.eq_ignore_ascii_case(d)) && (git || !n.eq_ignore_ascii_case(".git"))
+}
+
+/// 对依赖目录的处理。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DepSkip {
+    /// 全部复制。
+    None,
+    /// 跳过能重新生成的，.git 照常复制。
+    KeepGit,
+    /// 连 .git 一起跳过。
+    All,
 }
 
 /// 选中的文件夹里面的一个依赖目录（嵌套的只算最外层）。
@@ -89,14 +100,15 @@ impl Plan {
 
     /// `path` 在第 `top` 个顶层条目（根是 `root`）里面时，它所在的最外层依赖目录，相对 `root`。
     /// 顶层条目本身叫 node_modules 不算：那是用户点名要拷的。
-    fn dep_root(&self, path: &Path, top: u32, dst: bool) -> Option<PathBuf> {
+    /// `git` 为 false 时不把 .git 当依赖目录。
+    fn dep_root(&self, path: &Path, top: u32, dst: bool, git: bool) -> Option<PathBuf> {
         let t = self.tops.get(top as usize)?;
         let root = if dst { &t.dst } else { &t.src };
         let rel = path.strip_prefix(root).ok()?;
         let mut acc = PathBuf::new();
         for c in rel.components() {
             acc.push(c);
-            if is_dep(c.as_os_str()) {
+            if is_dep(c.as_os_str(), git) {
                 return Some(acc);
             }
         }
@@ -108,7 +120,7 @@ impl Plan {
         let mut map: std::collections::BTreeMap<PathBuf, (usize, u64)> = Default::default();
         for f in &self.files {
             // 只看文件所在的目录，文件本身叫 venv 不算
-            if let Some(d) = f.src.parent().and_then(|p| self.dep_root(p, f.top, false)) {
+            if let Some(d) = f.src.parent().and_then(|p| self.dep_root(p, f.top, false, true)) {
                 let top_name = self.tops[f.top as usize].src.file_name().map(PathBuf::from).unwrap_or_default();
                 let e = map.entry(top_name.join(d)).or_default();
                 e.0 += 1;
@@ -119,14 +131,18 @@ impl Plan {
     }
 
     /// 从计划里去掉依赖目录里的文件和要建的目录，返回去掉的文件数。只用于复制计划。
-    pub fn drop_deps(&mut self) -> usize {
+    pub fn drop_deps(&mut self, how: DepSkip) -> usize {
+        if how == DepSkip::None {
+            return 0;
+        }
+        let git = how == DepSkip::All;
         let before = self.files.len();
-        let keep: Vec<bool> = self.files.iter().map(|f| f.src.parent().and_then(|p| self.dep_root(p, f.top, false)).is_none()).collect();
+        let keep: Vec<bool> = self.files.iter().map(|f| f.src.parent().and_then(|p| self.dep_root(p, f.top, false, git)).is_none()).collect();
         let mut it = keep.iter();
         self.files.retain(|_| *it.next().unwrap());
         self.total_bytes = self.files.iter().map(|f| f.size).sum();
         let tops: Vec<u32> = (0..self.tops.len() as u32).collect();
-        let keep_dir: Vec<bool> = self.dirs.iter().map(|d| tops.iter().all(|&t| self.dep_root(d, t, true).is_none())).collect();
+        let keep_dir: Vec<bool> = self.dirs.iter().map(|d| tops.iter().all(|&t| self.dep_root(d, t, true, git).is_none())).collect();
         let mut it = keep_dir.iter();
         self.dirs.retain(|_| *it.next().unwrap());
         before - self.files.len()
