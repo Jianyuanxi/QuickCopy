@@ -30,6 +30,7 @@
 - 同名冲突：替换、跳过或两个都保留，可勾“对剩下的都这样”。不会悄悄覆盖：被替换的旧文件先改名藏起来，撤销时还原。
 - 同盘移动直接改路径；跨盘移动先复制、核对，再删源文件。
 - Ctrl+Z 撤销：复制的撤销是把拷出来的文件送回收站，移动的撤销是移回原处。和系统自己的撤销按时间顺序交替进行。
+- 依赖目录：复制的文件夹里有 `node_modules`、`.venv`、`venv`、`__pycache__`、`.git`，并且加起来不少于 300 个文件时，先问要不要跳过。拷代码项目到 U 盘时最有用（实测 45 s 降到 0.4 s）。移动时不问。
 
 ## 构建与安装
 
@@ -45,11 +46,11 @@ cargo build --release
 target/release/quickcopy.exe --install
 ```
 
-在“启动”文件夹建快捷方式 `QuickCopy.lnk`，开机自动运行。直接双击 `quickcopy.exe` 也能启动，重复启动只会运行一个。
+把 `quickcopy.exe` 和 `qc-ui-win32.exe` 复制到 `%LOCALAPPDATA%\QuickCopy\bin`，在“启动”文件夹建指向那份的快捷方式 `QuickCopy.lnk`，再退出旧的常驻进程、启动安装的那份。之后重新构建不会替换正在用的程序；改完代码要生效，再跑一次 `--install`。直接双击 `quickcopy.exe` 也能启动，重复启动只会运行一个。
 
 | 命令 | 作用 |
 |---|---|
-| `quickcopy.exe --install` | 开机启动 |
+| `quickcopy.exe --install` | 安装到 `%LOCALAPPDATA%\QuickCopy\bin` 并开机启动 |
 | `quickcopy.exe --uninstall` | 取消开机启动 |
 | `quickcopy.exe --quit` | 退出正在运行的常驻进程 |
 

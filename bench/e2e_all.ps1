@@ -7,10 +7,13 @@ param(
 # 撤销会把复制出来的文件送进回收站。跑完删掉撤销日志里本脚本留下的条目。
 $ErrorActionPreference = 'Stop'
 $base = Join-Path (Resolve-Path "$PSScriptRoot\..").Path '.tmp\e2e'
-$ops = Join-Path $env:LOCALAPPDATA 'QuickCopy\ops.json'
-$opsBackup = "$ops.e2e-backup"
-# 用空的撤销日志跑，免得撤到用户自己的操作上
-if (Test-Path $ops) { Move-Item $ops $opsBackup -Force }
+# 用项目里的空数据目录跑（撤销日志、任务单、日志都在这），免得撤到用户自己的操作上。
+# 不能靠把真实 ops.json 挪开：在 Claude 桌面版（MSIX）里跑时，挪走的只是包内副本，
+# 读的时候会落到用户真实的撤销日志上（2026-10-22 因此撤到过用户的操作）。e2e.ps1 和它拉起的进程都继承这个变量。
+$realLocal = $env:LOCALAPPDATA
+$env:LOCALAPPDATA = Join-Path (Resolve-Path "$PSScriptRoot\..").Path '.tmp\e2e-appdata'
+if (Test-Path $env:LOCALAPPDATA) { Remove-Item $env:LOCALAPPDATA -Recurse -Force }
+New-Item -ItemType Directory $env:LOCALAPPDATA -Force | Out-Null
 $fails = [Collections.Generic.List[string]]::new()
 
 function Fresh($d) {
@@ -36,6 +39,8 @@ function Check($name, $cond, $detail) {
 }
 function E2E { & "$PSScriptRoot\e2e.ps1" @args | ForEach-Object { "    $_" } }
 
+# 中途出错也要还原环境、退出测试用的常驻进程、换回安装版，否则开发版会带着测试数据目录一直接管用户的粘贴
+try {
 Fresh $base
 Fresh $Other
 
@@ -90,7 +95,29 @@ Check '跨盘剪切后 Ctrl+Z：移回原处' ((Tree $xs) -eq $srcBefore -and (T
 $out = E2E -Key Z -Dest $xd
 Check '没有可撤销的：Ctrl+Z 交给系统' (($out -join "`n") -match '交还系统：没有可撤销的操作') ($out -join ' / ')
 
-# 还原撤销日志
-if (Test-Path $opsBackup) { Move-Item $opsBackup $ops -Force } elseif (Test-Path $ops) { Remove-Item $ops }
+# 7. 依赖目录：项目里有 node_modules（300 个文件）和 __pycache__，点跳过只拷源码；点全部复制都拷
+$ps = "$base\p-src\proj"
+Put "$ps\main.py" 'm'; Put "$ps\src\a.js" 'a'; Put "$ps\__pycache__\main.pyc" 'c'
+1..300 | ForEach-Object { Put "$ps\node_modules\pkg$($_ % 10)\f$_.js" 'x' }
+$pd = "$base\p-dst1"; New-Item -ItemType Directory $pd -Force | Out-Null
+E2E -Src $ps -Dest $pd -Dialog 'skipdeps'
+Check '依赖目录：跳过' ((Tree $pd) -eq 'proj=<dir>; proj\main.py=m; proj\src=<dir>; proj\src\a.js=a') (Tree $pd)
+$pd = "$base\p-dst2"; New-Item -ItemType Directory $pd -Force | Out-Null
+E2E -Src $ps -Dest $pd -Dialog 'copyall'
+$n = (Get-ChildItem $pd -Recurse -File).Count
+Check '依赖目录：全部复制' ($n -eq 303) "文件数 $n，期望 303"
+
+} finally {
+  # 换回安装版常驻进程（e2e.ps1 启动的是 target 里的开发版）。
+  # 用 WMI 在 MSIX 容器外启动，否则它读写的是包内的 AppData 副本，看不到用户真实的撤销日志
+  $env:LOCALAPPDATA = $realLocal
+  & "$PSScriptRoot\..\target\release\quickcopy.exe" --quit
+  $installed = Join-Path $realLocal 'QuickCopy\bin\quickcopy.exe'
+  if (Test-Path $installed) {
+    Start-Sleep -Milliseconds 500
+    $r = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = "`"$installed`"" }
+    if ($r.ReturnValue -eq 0) { "已换回安装版 $installed" } else { "换回安装版失败（WMI 返回 $($r.ReturnValue)），请手动运行 $installed" }
+  }
+}
 ""
 if ($fails.Count) { "$($fails.Count) 项失败" } else { '全部通过' }

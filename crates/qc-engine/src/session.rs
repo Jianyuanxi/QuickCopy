@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use crate::undo::{self, Op};
-use crate::{execute, prepare, FileItem, Job, Options, Plan, Progress, Report, Resolution};
+use crate::{execute, prepare, DepDir, FileItem, Job, Mode, Options, Plan, Progress, Report, Resolution, DEP_ASK_MIN_FILES};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Phase {
@@ -16,6 +16,8 @@ pub enum Phase {
     NeedDecision = 1,
     Copying = 2,
     Done = 3,
+    /// 扫描完发现依赖目录（node_modules 等），等界面调用 `skip_deps()`。
+    AskDeps = 4,
 }
 
 /// 界面对所有冲突给出的答复：按文件下标查，没有的用 `default`。
@@ -32,8 +34,11 @@ pub struct Session {
     pub plan: OnceLock<Plan>,
     pub report: OnceLock<Report>,
     pub error: OnceLock<String>,
+    /// 要问的依赖目录，`Phase::AskDeps` 时有值。
+    pub deps: OnceLock<Vec<DepDir>>,
     phase: AtomicU8,
     decide_tx: SyncSender<Decision>,
+    deps_tx: SyncSender<bool>,
     meter: Mutex<VecDeque<(Instant, u64)>>,
     pub started: Instant,
 }
@@ -64,6 +69,7 @@ impl Session {
 
     fn spawn(job: Job, undo: Option<Op>) -> Arc<Session> {
         let (tx, rx) = sync_channel(1);
+        let (deps_tx, deps_rx) = sync_channel(1);
         let s = Arc::new(Session {
             job,
             undo,
@@ -71,24 +77,26 @@ impl Session {
             plan: OnceLock::new(),
             report: OnceLock::new(),
             error: OnceLock::new(),
+            deps: OnceLock::new(),
             phase: AtomicU8::new(Phase::Scanning as u8),
             decide_tx: tx,
+            deps_tx,
             meter: Mutex::new(VecDeque::new()),
             started: Instant::now(),
         });
         let s2 = s.clone();
-        std::thread::spawn(move || s2.run(rx));
+        std::thread::spawn(move || s2.run(rx, deps_rx));
         s
     }
 
-    fn run(&self, rx: Receiver<Decision>) {
+    fn run(&self, rx: Receiver<Decision>, deps_rx: Receiver<bool>) {
         if let Some(op) = &self.undo {
             self.phase.store(Phase::Copying as u8, Relaxed);
             let _ = self.report.set(undo::undo(op, &self.prog));
             self.phase.store(Phase::Done as u8, Relaxed);
             return;
         }
-        let p = match prepare(&self.job) {
+        let mut p = match prepare(&self.job) {
             Ok(p) => p,
             Err(e) => {
                 let _ = self.error.set(e);
@@ -96,6 +104,21 @@ impl Session {
                 return;
             }
         };
+        // 只在复制时问：跨盘移动跳过了依赖目录的话，源文件夹会删不干净
+        if self.job.mode == Mode::Copy {
+            let deps = p.dep_dirs();
+            if deps.iter().map(|d| d.files).sum::<usize>() >= DEP_ASK_MIN_FILES {
+                let _ = self.deps.set(deps);
+                self.phase.store(Phase::AskDeps as u8, Relaxed);
+                if deps_rx.recv().unwrap_or(false) {
+                    p.drop_deps();
+                }
+                if self.prog.cancel.load(Relaxed) {
+                    self.phase.store(Phase::Done as u8, Relaxed);
+                    return;
+                }
+            }
+        }
         let conflicts = p.conflict_count();
         let _ = self.plan.set(p);
         let plan = self.plan.get().unwrap();
@@ -125,11 +148,17 @@ impl Session {
         let _ = self.decide_tx.try_send(d);
     }
 
+    /// 回答依赖目录的询问：true 跳过它们。
+    pub fn skip_deps(&self, skip: bool) {
+        let _ = self.deps_tx.try_send(skip);
+    }
+
     pub fn phase(&self) -> Phase {
         match self.phase.load(Relaxed) {
             0 => Phase::Scanning,
             1 => Phase::NeedDecision,
             2 => Phase::Copying,
+            4 => Phase::AskDeps,
             _ => Phase::Done,
         }
     }
@@ -144,6 +173,7 @@ impl Session {
     pub fn cancel(&self) {
         self.prog.cancel.store(true, Relaxed);
         self.prog.paused.store(false, Relaxed);
+        self.skip_deps(false);
         self.decide(Decision { default: Resolution::Skip, per_file: Default::default() });
     }
 

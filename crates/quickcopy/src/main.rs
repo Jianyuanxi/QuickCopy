@@ -9,7 +9,7 @@ mod autostart;
 mod order;
 mod shell;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Sender};
 use std::sync::OnceLock;
 
@@ -43,18 +43,16 @@ fn main() {
     if args.iter().any(|a| a == "--install" || a == "--uninstall") {
         let on = args.iter().any(|a| a == "--install");
         let ui = args.iter().position(|a| a == "--ui").and_then(|i| args.get(i + 1)).map(String::as_str);
-        if let Err(e) = autostart::set(on, ui) {
-            log(&format!("设置开机启动失败：{e}"));
+        let r = if on { install(ui) } else { autostart::set(false, Path::new(""), ui).map_err(|e| e.to_string()) };
+        if let Err(e) = r {
+            log(&format!("{}失败：{e}", if on { "安装" } else { "取消开机启动" }));
+            eprintln!("{e}");
             std::process::exit(1);
         }
         return;
     }
     if args.iter().any(|a| a == "--quit") {
-        unsafe {
-            if let Ok(h) = FindWindowExW(Some(HWND_MESSAGE), None, w!("QuickCopyHook"), None) {
-                let _ = PostMessageW(Some(h), WM_CLOSE, WPARAM(0), LPARAM(0));
-            }
-        }
+        quit_running();
         return;
     }
     unsafe {
@@ -103,6 +101,99 @@ fn main() {
         let _ = UnhookWindowsHookEx(hook);
         log("stopped");
     }
+}
+
+/// 让正在运行的常驻进程退出，最多等 3 秒它的窗口消失。
+fn quit_running() {
+    unsafe {
+        let Ok(h) = FindWindowExW(Some(HWND_MESSAGE), None, w!("QuickCopyHook"), None) else { return };
+        let _ = PostMessageW(Some(h), WM_CLOSE, WPARAM(0), LPARAM(0));
+        for _ in 0..30 {
+            if !IsWindow(Some(h)).as_bool() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
+}
+
+fn spawn_resident(exe: &Path, ui: Option<&str>) -> Result<(), String> {
+    let mut cmd = std::process::Command::new(exe);
+    if let Some(ui) = ui {
+        cmd.args(["--ui", ui]);
+    }
+    if let Some(d) = exe.parent() {
+        cmd.current_dir(d);
+    }
+    cmd.spawn().map(|_| ()).map_err(|e| format!("启动 {} 失败：{e}", exe.display()))
+}
+
+/// `--install`：把常驻进程和界面复制到 `%LOCALAPPDATA%\QuickCopy\bin`，开机启动指向那份，再换成那份运行。
+/// 这样开发时重新 `cargo build` 不会替换正在用的程序，也不会因为文件被占用而构建失败。
+///
+/// 先把新文件全部复制成 `*.new`，都成功了才动正在用的：旧文件改名成 `*.old`（运行中的 exe 也能改名，
+/// 所以界面正在复制也不怕），再把 `*.new` 改成正式名字。中途失败就把 `*.old` 改回去，重新拉起原来的常驻进程。
+fn install(ui: Option<&str>) -> Result<(), String> {
+    let src = std::env::current_exe().map_err(|e| e.to_string())?;
+    let src_dir = src.parent().ok_or("取不到程序所在目录")?;
+    let bin = qc_engine::ticket::data_dir().join("bin");
+    let exe = bin.join("quickcopy.exe");
+    if !qc_engine::same_path(src_dir, &bin) {
+        std::fs::create_dir_all(&bin).map_err(|e| format!("建目录 {} 失败：{e}", bin.display()))?;
+        let names = ["quickcopy.exe".to_string(), format!("qc-ui-{}.exe", ui.unwrap_or("win32"))];
+        let with = |name: &str, ext: &str| bin.join(format!("{name}.{ext}"));
+        for name in &names {
+            // 上次安装留下的 .old 可能还被没退出的界面占着，删不掉就算了，下面改名时会覆盖
+            let _ = std::fs::remove_file(with(name, "old"));
+            if let Err(e) = std::fs::copy(src_dir.join(name), with(name, "new")) {
+                for n in &names {
+                    let _ = std::fs::remove_file(with(n, "new"));
+                }
+                return Err(format!("复制 {name} 失败，没有改动已安装的程序：{e}"));
+            }
+        }
+        let was_running = unsafe { FindWindowExW(Some(HWND_MESSAGE), None, w!("QuickCopyHook"), None).is_ok() };
+        quit_running();
+        let mut swapped: Vec<&String> = Vec::new();
+        let mut failed = None;
+        for name in &names {
+            let (cur, old, new) = (bin.join(name), with(name, "old"), with(name, "new"));
+            if cur.exists() {
+                if let Err(e) = std::fs::rename(&cur, &old) {
+                    failed = Some(format!("{name} 改名失败：{e}"));
+                    break;
+                }
+            }
+            swapped.push(name);
+            if let Err(e) = std::fs::rename(&new, &cur) {
+                failed = Some(format!("{name} 换新失败：{e}"));
+                break;
+            }
+        }
+        if let Some(e) = failed {
+            for name in swapped {
+                let (cur, old) = (bin.join(name), with(name, "old"));
+                if old.exists() {
+                    let _ = std::fs::remove_file(&cur);
+                    let _ = std::fs::rename(&old, &cur);
+                }
+            }
+            for n in &names {
+                let _ = std::fs::remove_file(with(n, "new"));
+            }
+            if was_running && exe.exists() {
+                let _ = spawn_resident(&exe, ui);
+            }
+            return Err(format!("{e}，已还原原来的程序"));
+        }
+        for name in &names {
+            let _ = std::fs::remove_file(with(name, "old"));
+        }
+    }
+    autostart::set(true, &exe, ui).map_err(|e| e.to_string())?;
+    spawn_resident(&exe, ui)?;
+    log(&format!("已安装到 {}", bin.display()));
+    Ok(())
 }
 
 unsafe extern "system" fn wnd_proc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {

@@ -2,6 +2,8 @@
 //! 本机（Win11 26300）开机时 Explorer 跳过了新写入的 Run 项（Shell-Core 日志 9707 里没有它，同次开机的
 //! Span、Everything 都执行了；StartupApproved 写成启用也没用），快捷方式能正常启动（2026-10-20 重启验证，做法同 QuickView）。
 
+use std::path::Path;
+
 use windows::core::{Interface, HSTRING};
 use windows::Win32::System::Com::*;
 use windows::Win32::System::Registry::{RegDeleteKeyValueW, HKEY_CURRENT_USER};
@@ -26,9 +28,8 @@ fn startup_lnk() -> Option<std::path::PathBuf> {
     }
 }
 
-fn write_lnk(ui: Option<&str>) -> windows::core::Result<()> {
+fn write_lnk(exe: &Path, ui: Option<&str>) -> windows::core::Result<()> {
     let lnk = startup_lnk().ok_or(windows::core::Error::empty())?;
-    let exe = std::env::current_exe().unwrap_or_default();
     unsafe {
         let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
         let sl: IShellLinkW = CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER)?;
@@ -44,12 +45,12 @@ fn write_lnk(ui: Option<&str>) -> windows::core::Result<()> {
     }
 }
 
-/// `--install` / `--uninstall`：建或删快捷方式；打开时顺带清掉"设置 > 启动应用"里的禁用记录
-pub fn set(on: bool, ui: Option<&str>) -> windows::core::Result<()> {
+/// `--install` / `--uninstall`：建或删指向 `exe` 的快捷方式；打开时顺带清掉"设置 > 启动应用"里的禁用记录
+pub fn set(on: bool, exe: &Path, ui: Option<&str>) -> windows::core::Result<()> {
     remove_old();
     del(APPROVED_LNK, LNK_NAME);
     if on {
-        write_lnk(ui)
+        write_lnk(exe, ui)
     } else {
         if let Some(p) = startup_lnk() {
             let _ = std::fs::remove_file(p);
@@ -68,6 +69,6 @@ fn remove_old() -> bool {
 /// 常驻进程启动时调用：旧版用 Run 开过自启的，迁成快捷方式（已有快捷方式就不动，免得覆盖用户在设置里的开关）
 pub fn migrate() {
     if remove_old() && startup_lnk().is_some_and(|p| !p.exists()) {
-        let _ = write_lnk(None);
+        let _ = write_lnk(&std::env::current_exe().unwrap_or_default(), None);
     }
 }

@@ -234,13 +234,20 @@ unsafe fn set_text(h: HWND, s: &str) {
 unsafe fn tick(hwnd: HWND) {
     let session = SESSION.get().unwrap();
     let snap = session.snapshot();
-    if snap.phase == Phase::NeedDecision {
+    if matches!(snap.phase, Phase::NeedDecision | Phase::AskDeps) {
         if UI.with(|u| std::mem::replace(&mut u.borrow_mut().asking, true)) {
             return;
         }
-        match ask_conflicts(hwnd, session) {
-            Some(d) => session.decide(d),
-            None => session.cancel(),
+        if snap.phase == Phase::AskDeps {
+            match ask_deps(hwnd, session) {
+                Some(skip) => session.skip_deps(skip),
+                None => session.cancel(),
+            }
+        } else {
+            match ask_conflicts(hwnd, session) {
+                Some(d) => session.decide(d),
+                None => session.cancel(),
+            }
         }
         UI.with(|u| {
             let mut u = u.borrow_mut();
@@ -469,6 +476,54 @@ fn describe(p: &Path) -> (String, u64) {
 const ID_REPLACE: i32 = 1001;
 const ID_SKIP: i32 = 1002;
 const ID_KEEP: i32 = 1003;
+const ID_SKIP_DEPS: i32 = 1011;
+const ID_COPY_ALL: i32 = 1012;
+
+/// 问要不要跳过 node_modules 这类目录。返回 Some(true) 跳过，None 表示取消整个操作。
+unsafe fn ask_deps(owner: HWND, session: &Session) -> Option<bool> {
+    let deps = session.deps.get()?;
+    let (files, bytes) = deps.iter().fold((0, 0), |(f, b), d| (f + d.files, b + d.bytes));
+    let mut list: Vec<String> = deps.iter().take(6).map(|d| format!("{}　{} 个文件，{}", d.rel.display(), d.files, fmt_bytes(d.bytes as f64))).collect();
+    if deps.len() > 6 {
+        list.push(format!("…另外 {} 个", deps.len() - 6));
+    }
+    let has_git = deps.iter().any(|d| d.rel.file_name().is_some_and(|n| n.eq_ignore_ascii_case(".git")));
+    let note = if has_git { "\n\n.git 是版本历史，跳过后目标里没有提交记录。" } else { "" };
+
+    let title = HSTRING::from("复制文件夹");
+    let main = HSTRING::from("要复制的文件夹里有依赖和缓存目录");
+    let content = HSTRING::from(format!("{}{note}", list.join("\n")));
+    let b_skip = HSTRING::from(format!("跳过这些目录\n少复制 {files} 个文件、{}，依赖之后可以重新安装", fmt_bytes(bytes as f64)));
+    let b_all = HSTRING::from("全部复制\n包括这些目录");
+    let buttons = [
+        TASKDIALOG_BUTTON { nButtonID: ID_SKIP_DEPS, pszButtonText: PCWSTR(b_skip.as_ptr()) },
+        TASKDIALOG_BUTTON { nButtonID: ID_COPY_ALL, pszButtonText: PCWSTR(b_all.as_ptr()) },
+    ];
+    let cfg = TASKDIALOGCONFIG {
+        cbSize: size_of::<TASKDIALOGCONFIG>() as u32,
+        hwndParent: if IsWindowVisible(owner).as_bool() { owner } else { HWND::default() },
+        dwFlags: TDF_USE_COMMAND_LINKS | TDF_ALLOW_DIALOG_CANCELLATION | TDF_POSITION_RELATIVE_TO_WINDOW,
+        dwCommonButtons: TDCBF_CANCEL_BUTTON,
+        pszWindowTitle: PCWSTR(title.as_ptr()),
+        pszMainInstruction: PCWSTR(main.as_ptr()),
+        pszContent: PCWSTR(content.as_ptr()),
+        cButtons: buttons.len() as u32,
+        pButtons: buttons.as_ptr(),
+        nDefaultButton: ID_SKIP_DEPS,
+        pfCallback: Some(dialog_proc),
+        ..Default::default()
+    };
+    let mut button = 0i32;
+    if TaskDialogIndirect(&cfg, Some(&mut button), None, None).is_err() {
+        log("win32: 依赖目录对话框打不开，按全部复制处理");
+        return Some(false);
+    }
+    match button {
+        ID_SKIP_DEPS => Some(true),
+        ID_COPY_ALL => Some(false),
+        _ => None,
+    }
+}
 
 unsafe extern "system" fn dialog_proc(h: HWND, msg: TASKDIALOG_NOTIFICATIONS, _: WPARAM, _: LPARAM, _: isize) -> windows::core::HRESULT {
     if msg == TDN_CREATED {
